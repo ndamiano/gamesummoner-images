@@ -1,57 +1,90 @@
-"""The image side of the worker contract: /health, /metadata, /job, /shutdown.
-
-An adapter supplies the engine-specific parts (readiness, running one job); the provider's
-entrypoint supplies the decommission command. Standard library only, so it runs on whatever
-python the engine's base image ships.
-
-    python3 contract/server.py --adapter llm --engine-url http://127.0.0.1:30000 \
-        --engine-pid 123 --capability llm --cli-params "..." --decommission "kill -TERM 1"
-"""
-
 import argparse
 import json
 import logging
 import os
-import subprocess
-import sys
+import signal
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-import llm  # noqa: E402
 
 logger = logging.getLogger("image")
 
-ADAPTERS = {"llm": llm.LlmAdapter}
 DECOMMISSION_DELAY_SECONDS = 1.0
+PROBE_INTERVAL_SECONDS = 2.0
 
 
-class Image:
-    def __init__(self, adapter, metadata: dict, decommission: str, engine_pid: int | None):
-        self.adapter = adapter
-        self.metadata = metadata
-        self.decommission = decommission
-        self.engine_pid = engine_pid
+class Server:
+    capabilities: tuple[str, ...] = ()
+    kinds: tuple[str, ...] = ()
+
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
+        parser.add_argument("--image-id", required=True,
+                            help="the build's id, reported in /metadata")
+        parser.add_argument("--cli-params", default="",
+                            help="the engine's command line, reported in /metadata")
+        parser.add_argument("--engine-pid", type=int, default=None,
+                            help="engine process to watch: /health answers 500 once it exits")
+        parser.add_argument("--entrypoint-pid", type=int, default=None,
+                            help="the entrypoint to SIGTERM on decommission; it ends the box")
+        parser.add_argument("--host", default="127.0.0.1")
+        parser.add_argument("--port", type=int, default=8700)
+
+    @classmethod
+    def from_argv(cls, argv=None):
+        parser = argparse.ArgumentParser(description=cls.__doc__)
+        cls.add_arguments(parser)
+        return cls(parser.parse_args(argv))
+
+    def __init__(self, args: argparse.Namespace):
+        self.metadata = {"imageId": args.image_id, "cliParams": args.cli_params,
+                         "capabilities": list(self.capabilities)}
+        self.engine_pid = args.engine_pid
+        self.entrypoint_pid = args.entrypoint_pid
+        self.bind = (args.host, args.port)
         self.leaving = False
         self._lock = threading.Lock()
+        self._verdict = (503, "not probed yet")
 
-    def health(self) -> tuple:
+
+    def ready(self) -> tuple[int, str]:
+        raise NotImplementedError
+
+    def run(self, job_type: str, payload: dict) -> tuple[int, dict]:
+        raise NotImplementedError
+
+    def decommission(self) -> None:
+        if self.entrypoint_pid is None:
+            logger.warning("no --entrypoint-pid: nothing ends the box")
+            return
+        os.kill(self.entrypoint_pid, signal.SIGTERM)
+
+
+    def start(self) -> ThreadingHTTPServer:
+        threading.Thread(target=self._probe_loop, daemon=True).start()
+        return ThreadingHTTPServer(self.bind, make_handler(self))
+
+    def _probe_loop(self) -> None:
+        while not self.leaving:
+            try:
+                self._verdict = self.ready()
+            except Exception as e:  # noqa: BLE001
+                self._verdict = (503, f"readiness probe failed ({e.__class__.__name__})")
+            time.sleep(PROBE_INTERVAL_SECONDS)
+
+    def health(self) -> tuple[int, str]:
         if self.leaving:
             return 410, "decommissioning"
         if self.engine_pid is not None and not _alive(self.engine_pid):
             return 500, f"engine process {self.engine_pid} exited"
-        ready, reason = self.adapter.ready()
-        return (200, reason or "ready") if ready else (503, reason)
+        return self._verdict
 
-    def job(self, body: dict) -> tuple:
+    def job(self, body: dict) -> tuple[int, dict]:
         job_type = body.get("type")
-        if job_type not in self.metadata["capabilities"]:
+        if job_type not in self.kinds:
             return 500, {"status": "failed", "error": f"this image does not run {job_type!r} jobs"}
         started = time.perf_counter()
-        status, out = self.adapter.run(job_type, body.get("payload") or {})
+        status, out = self.run(job_type, body.get("payload") or {})
         logger.info("job %s (%s) -> %s in %.1fs", body.get("jobId"), job_type, status,
                     time.perf_counter() - started)
         return status, out
@@ -61,11 +94,14 @@ class Image:
             if self.leaving:
                 return
             self.leaving = True
-        logger.info("decommission requested — running %r", self.decommission)
+        logger.info("decommission requested")
 
         def later():
             time.sleep(DECOMMISSION_DELAY_SECONDS)
-            subprocess.run(self.decommission, shell=True, check=False)
+            try:
+                self.decommission()
+            except Exception:  # noqa: BLE001
+                logger.exception("decommission failed")
 
         threading.Thread(target=later, daemon=True).start()
 
@@ -80,7 +116,7 @@ def _alive(pid: int) -> bool:
     return True
 
 
-def make_handler(image: Image):
+def make_handler(image: Server):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -125,29 +161,11 @@ def make_handler(image: Image):
     return Handler
 
 
-def main(argv=None) -> int:
-    parser = argparse.ArgumentParser(description="GameSummoner image contract server")
-    parser.add_argument("--adapter", required=True, choices=sorted(ADAPTERS))
-    parser.add_argument("--engine-url", required=True)
-    parser.add_argument("--engine-pid", type=int, default=None)
-    parser.add_argument("--capability", action="append", required=True)
-    parser.add_argument("--image-id", required=True)
-    parser.add_argument("--cli-params", default="")
-    parser.add_argument("--decommission", required=True)
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=8700)
-    args = parser.parse_args(argv)
-
+def main(server_cls: type[Server], argv=None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s: %(message)s")
-    metadata = {"imageId": args.image_id, "cliParams": args.cli_params,
-                "capabilities": args.capability}
-    image = Image(ADAPTERS[args.adapter](args.engine_url), metadata, args.decommission,
-                  args.engine_pid)
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(image))
-    logger.info("contract server on %s:%d, %s", args.host, args.port, metadata)
-    server.serve_forever()
+    image = server_cls.from_argv(argv)
+    httpd = image.start()
+    host, port = httpd.server_address[:2]
+    logger.info("contract server on %s:%d, %s", host, port, image.metadata)
+    httpd.serve_forever()
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

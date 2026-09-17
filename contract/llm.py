@@ -1,10 +1,9 @@
-"""The llm adapter: a canonical chat request (OpenAI chat shape plus `reasoning` as an effort
-string) forwarded to an OpenAI-compatible engine's /v1/chat/completions. No request timeout: the
-worker owns the job's deadline."""
-
+import argparse
 import json
 import urllib.error
 import urllib.request
+
+from contract.server import Server
 
 REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh"}
 
@@ -16,19 +15,30 @@ def chat_body_for_engine(body: dict) -> dict:
     return out
 
 
-class LlmAdapter:
-    def __init__(self, engine_url: str):
-        self.engine_url = engine_url.rstrip("/")
+class LlmServer(Server):
 
-    def ready(self) -> tuple:
+    capabilities = ("llm",)
+    kinds = ("llm",)
+
+    @classmethod
+    def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
+        super().add_arguments(parser)
+        parser.add_argument("--engine-url", required=True,
+                            help="base url of the OpenAI-compatible engine")
+
+    def __init__(self, args: argparse.Namespace):
+        super().__init__(args)
+        self.engine_url = args.engine_url.rstrip("/")
+
+    def ready(self) -> tuple[int, str]:
         try:
             with urllib.request.urlopen(f"{self.engine_url}/v1/models", timeout=5) as r:
                 models = [m.get("id") for m in json.load(r).get("data", [])]
         except (OSError, ValueError) as e:
-            return False, f"engine not answering ({e.__class__.__name__})"
-        return (True, f"serving {models}") if models else (False, "engine lists no models")
+            return 503, f"engine not answering ({e.__class__.__name__})"
+        return (200, f"serving {models}") if models else (503, "engine lists no models")
 
-    def run(self, job_type: str, payload: dict) -> tuple:
+    def run(self, job_type: str, payload: dict) -> tuple[int, dict]:
         request = urllib.request.Request(
             f"{self.engine_url}/v1/chat/completions",
             data=json.dumps(chat_body_for_engine(payload.get("body") or {})).encode(),

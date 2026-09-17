@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Local llm box: pull the weights, pull the pinned worker, then run SGLang, the contract server
-# and the worker side by side. Decommissioning the box is ending this script: the contract
+# Local llm box: pull the weights, then run SGLang, the contract server and the baked worker side
+# by side. Decommissioning the box is ending this script: the contract
 # server's /shutdown signals it, and so does `docker stop`.
 set -euo pipefail
 
@@ -10,7 +10,7 @@ MODEL_REVISION=5b7a687fc8211a5d631c8ca6a593dd37eb26ce33
 ENGINE_CONTEXT=262144
 ENGINE_PORT=30000
 IMAGE_PORT=8700
-WORKER_DIR=/tmp/gamesummoner-worker
+WORKER_DIR=/opt/gamesummoner/worker
 WORKER_GRACE_SECONDS=60
 
 boot_t0=$(date +%s)
@@ -37,12 +37,6 @@ print(snapshot_download(sys.argv[1], revision=sys.argv[2], ignore_patterns=["ass
 ' "$MODEL_REPO" "$MODEL_REVISION")
 mark "weights at $model_dir"
 
-worker_ref=$(cat /opt/gamesummoner/worker.ref)
-mark "pulling worker $worker_ref from $WORKER_REPO"
-rm -rf "$WORKER_DIR"
-git clone --quiet "$WORKER_REPO" "$WORKER_DIR"
-git -C "$WORKER_DIR" checkout --quiet --detach "$worker_ref"
-
 engine_args=(
     --model-path "$model_dir" --trust-remote-code
     --served-model-name "$LLM_MODEL" --context-length "$ENGINE_CONTEXT"
@@ -60,11 +54,10 @@ mark "starting engine: ${engine_args[*]}"
 python3 -m sglang.launch_server "${engine_args[@]}" &
 engine_pid=$!
 
-python3 /opt/gamesummoner/contract/server.py \
-    --adapter llm --capability llm \
+PYTHONPATH=/opt/gamesummoner python3 -m local.llm.server \
     --engine-url "http://127.0.0.1:$ENGINE_PORT" --engine-pid "$engine_pid" \
-    --image-id "$(cat /opt/gamesummoner/image-id)" --cli-params "${engine_args[*]}" \
-    --decommission "kill -TERM $$" --port "$IMAGE_PORT" &
+    --image-id "$(cat /opt/gamesummoner/image-id)" --cli-params="${engine_args[*]}" \
+    --entrypoint-pid $$ --port "$IMAGE_PORT" &
 contract_pid=$!
 
 PYTHONPATH="$WORKER_DIR/src" python3 -m gamesummoner_worker \

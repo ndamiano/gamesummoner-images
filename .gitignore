@@ -1,3 +1,6 @@
 __pycache__/
 .pytest_cache/
-local/**/env.json
+**/env.json
+**/*.tgz
+**/out/
+**/worker/
