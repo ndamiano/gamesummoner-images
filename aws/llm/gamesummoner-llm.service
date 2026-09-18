@@ -1,0 +1,16 @@
+[Unit]
+Description=GameSummoner llm box
+After=network-online.target dlami-nvme.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/gamesummoner/entrypoint.sh
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=120
+StandardOutput=append:/var/log/gamesummoner-llm.log
+StandardError=append:/var/log/gamesummoner-llm.log
+
+[Install]
+WantedBy=multi-user.target

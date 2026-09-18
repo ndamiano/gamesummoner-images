@@ -15,6 +15,7 @@ when it boots.
 | `engines/` | inference servers we wrote ourselves: `trellis/` (TRELLIS.2), `sprites/` (kimodo sheets); ComfyUI and SGLang are upstream |
 | `local/llm/` | the llm box for a local 5090: stock SGLang serving Qwen3.8 27B NVFP4 |
 | `runpod/` | the RunPod boxes, one per queue: [runpod/README.md](runpod/README.md) |
+| `aws/` | the EC2 boxes, an AMI per queue: [aws/README.md](aws/README.md) |
 
 The contract servers form a grid. `contract/server.py` is the corner; a queue's
 `contract/<queue>.py` is a column (`ready`, `run`, the engine's flags); a provider's
@@ -27,7 +28,7 @@ first, and the MRO threads the chain, so the cell needs no code of its own.
 |---|---|---|---|---|
 | `local/server.py` | `local/llm/` | | | |
 | `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/video/` | `runpod/mesh/` |
-| `aws/server.py` | | | | |
+| `aws/server.py` | `aws/llm/` | | | |
 
 A column sets two tuples: `capabilities`, the queue names a worker may pull for this box, and
 `kinds`, the payload kinds `/job` runs, which is what the worker sends as `type`. They differ
@@ -48,10 +49,11 @@ boots the same worker every time. Moving an image to a new worker is editing its
 and rebuilding.
 
 Decommissioning is the same everywhere so far: `/shutdown` SIGTERMs the entrypoint
-(`--entrypoint-pid`), the entrypoint drains the worker and ends, and the container ends with it.
-The instance behind the container is the control plane's to terminate, which it does for any
-worker that deregistered, so no image holds a provider credential. Both rows are empty classes
-until a provider needs more than that.
+(`--entrypoint-pid`), the entrypoint drains the worker and ends, and the container (or, on
+EC2, the systemd unit and then the instance) ends with it. A RunPod pod is the control plane's
+to terminate, which it does for any worker that deregistered; an EC2 instance terminates itself
+on power-off. No image holds a provider credential. Every row is an empty class until a
+provider needs more than that.
 
 ### Adding a queue
 

@@ -1,0 +1,165 @@
+diff --git a/python/sglang/srt/model_loader/prepacked_loader.py b/python/sglang/srt/model_loader/prepacked_loader.py
+index 2c8df8f..c4eaaf4 100644
+--- a/python/sglang/srt/model_loader/prepacked_loader.py
++++ b/python/sglang/srt/model_loader/prepacked_loader.py
+@@ -178,6 +178,75 @@ def _free_init_tensors(model: nn.Module, bound: set) -> None:
+         torch.cuda.empty_cache()
+ 
+ 
++class _PackParts:
++    """A pack is one flat file, or a directory of equal-sized parts beside it
++    (`<key>.parts/NNNN`, sizes in `<key>.parts/index.json`) that a downloader is
++    still filling in order. A part is ready once it has its full size; a read
++    that lands on a part not there yet waits for it, so the restore trails the
++    download instead of following it."""
++
++    def __init__(self, bin_path: Path):
++        self.bin_path = bin_path
++        self.dir = bin_path.with_suffix(".parts")
++        index = self.dir / "index.json"
++        self.split = index.is_file() and not bin_path.is_file()
++        if self.split:
++            spec = json.loads(index.read_text())
++            self.part_bytes = int(spec["part_bytes"])
++            self.total = int(spec["total_bytes"])
++        self.wait_seconds = float(os.getenv("SGLANG_PREPACKED_PART_TIMEOUT", "900"))
++        self._ready = set()
++        self.consume = self.split and os.getenv("SGLANG_PREPACKED_CONSUME") == "1"
++        self._pending = {}
++        self._lock = __import__("threading").Lock()
++
++    def account(self, chunks):
++        """Count the chunks touching each part, so a part can be deleted once consumed."""
++        if not self.consume:
++            return
++        for _, file_off, _, length in chunks:
++            for part in range(file_off // self.part_bytes, (file_off + length - 1) // self.part_bytes + 1):
++                self._pending[part] = self._pending.get(part, 0) + 1
++
++    def done(self, file_off, length):
++        if not self.consume:
++            return
++        for part in range(file_off // self.part_bytes, (file_off + length - 1) // self.part_bytes + 1):
++            with self._lock:
++                self._pending[part] -= 1
++                gone = self._pending[part] == 0
++            if gone:
++                try:
++                    os.unlink(self.path(part))
++                except FileNotFoundError:
++                    pass
++
++    def path(self, part: int) -> Path:
++        return self.bin_path if part < 0 else self.dir / f"{part:04d}"
++
++    def locate(self, file_off: int):
++        """(part, offset within it, bytes readable from there), waiting for the part."""
++        if not self.split:
++            return -1, file_off, 1 << 62
++        part = file_off // self.part_bytes
++        expected = min(self.part_bytes, self.total - part * self.part_bytes)
++        if part not in self._ready:
++            path = self.path(part)
++            deadline = time.monotonic() + self.wait_seconds
++            while True:
++                try:
++                    if os.path.getsize(path) >= expected:
++                        break
++                except FileNotFoundError:
++                    pass
++                if time.monotonic() > deadline:
++                    raise TimeoutError(f"pack part {path} never arrived")
++                time.sleep(0.05)
++            self._ready.add(part)
++        part_off = file_off - part * self.part_bytes
++        return part, part_off, expected - part_off
++
++
+ def restore_model(model: nn.Module, bin_path: Path, manifest_path: Path) -> None:
+     t0 = time.perf_counter()
+     manifest = json.loads(manifest_path.read_text())
+@@ -215,12 +284,36 @@ def restore_model(model: nn.Module, bin_path: Path, manifest_path: Path) -> None
+     next_chunk = iter(range(len(chunks)))
+     lock = __import__("threading").Lock()
+     errors = []
++    parts = _PackParts(bin_path)
++    parts.account(chunks)
+ 
+     def worker():
+         stream = torch.cuda.Stream() if use_cuda else None
+         pinned = torch.empty(_CHUNK, dtype=torch.uint8, pin_memory=use_cuda)
+         pinned_np = pinned.numpy()
+-        fd = os.open(bin_path, os.O_RDONLY)
++        fds = {}
++
++        def read_into(view, file_off):
++            done = 0
++            while done < len(view):
++                if parts.split:
++                    ahead = (file_off + done) // parts.part_bytes
++                    for stale in [p for p in fds if p < ahead]:
++                        os.close(fds.pop(stale))
++                part, part_off, avail = parts.locate(file_off + done)
++                fd = fds.get(part)
++                if fd is None:
++                    fd = fds[part] = os.open(parts.path(part), os.O_RDONLY)
++                take = min(len(view) - done, avail)
++                got = os.preadv(fd, [view[done : done + take]], part_off)
++                if got != take:
++                    raise IOError(f"short read at {file_off + done} in {bin_path}")
++                try:
++                    os.posix_fadvise(fd, part_off, take, os.POSIX_FADV_DONTNEED)
++                except OSError:
++                    pass
++                done += take
++
+         try:
+             while True:
+                 with lock:
+@@ -230,9 +323,7 @@ def restore_model(model: nn.Module, bin_path: Path, manifest_path: Path) -> None
+                 s_i, file_off, dst_off, length = chunks[i]
+                 flat = flats[s_i]
+                 if flat.device.type == "cuda":
+-                    got = os.preadv(fd, [memoryview(pinned_np)[:length]], file_off)
+-                    if got != length:
+-                        raise IOError(f"short read at {file_off} in {bin_path}")
++                    read_into(memoryview(pinned_np)[:length], file_off)
+                     with torch.cuda.stream(stream):
+                         flat[dst_off : dst_off + length].copy_(
+                             pinned[:length], non_blocking=True
+@@ -240,19 +331,13 @@ def restore_model(model: nn.Module, bin_path: Path, manifest_path: Path) -> None
+                     stream.synchronize()
+                 else:
+                     dst = flat[dst_off : dst_off + length].numpy()
+-                    got = os.preadv(fd, [memoryview(dst)], file_off)
+-                    if got != length:
+-                        raise IOError(f"short read at {file_off} in {bin_path}")
+-                # The pack is read once; cached pages of it fill the container
+-                # cgroup toward its cap and get the loader OOM-killed.
+-                try:
+-                    os.posix_fadvise(fd, file_off, length, os.POSIX_FADV_DONTNEED)
+-                except OSError:
+-                    pass
++                    read_into(memoryview(dst), file_off)
++                parts.done(file_off, length)
+         except Exception as e:  # surfaced after join
+             errors.append(e)
+         finally:
+-            os.close(fd)
++            for fd in fds.values():
++                os.close(fd)
+ 
+     import concurrent.futures
+ 
+@@ -380,8 +465,9 @@ def get_prepacked_loader_cls():
+             bin_path = pack_dir / f"{key}.bin"
+             manifest_path = pack_dir / f"{key}.json"
+ 
+-            if bin_path.is_file() and manifest_path.is_file():
+-                logger.info("Prepacked pack hit: %s", bin_path)
++            split = (pack_dir / f"{key}.parts" / "index.json").is_file() and not bin_path.is_file()
++            if (bin_path.is_file() or split) and manifest_path.is_file():
++                logger.info("Prepacked pack hit: %s%s", bin_path, " (parts)" if split else "")
+                 target_device = torch.device(device_config.device)
+                 quant_config = _get_quantization_config(model_config, self.load_config)
+                 with set_default_torch_dtype(model_config.dtype):
