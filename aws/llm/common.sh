@@ -1,6 +1,7 @@
 # Sourced by the aws/llm scripts: the region, the standing infrastructure, the pool walk.
 REGION=${AWS_REGION:-eu-north-1}
-BUCKET=gamesummoner-models-eu-north-1-<account>
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+BUCKET=gamesummoner-models-$REGION-$ACCOUNT
 INSTANCE_TYPE=${INSTANCE_TYPE:-g7e.2xlarge}
 SECURITY_GROUP_NAME=gs-gpu-worker
 INSTANCE_PROFILE=gs-gpu-worker

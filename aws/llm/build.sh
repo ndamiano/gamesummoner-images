@@ -36,7 +36,7 @@ echo "build $build_id, image id $image_id, shipped to s3://$BUCKET/build/$build_
 
 cat > "$out/user-data.sh" <<USERDATA
 #!/bin/bash
-export BUCKET=$BUCKET BUILD_ID=$build_id AWS_DEFAULT_REGION=$REGION
+export BUCKET=$BUCKET ACCOUNT=$ACCOUNT BUILD_ID=$build_id AWS_DEFAULT_REGION=$REGION
 command -v aws >/dev/null || snap install aws-cli --classic
 aws s3 cp s3://$BUCKET/build/$build_id/provision.sh /root/provision.sh
 bash /root/provision.sh

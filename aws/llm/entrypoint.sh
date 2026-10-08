@@ -88,8 +88,9 @@ if [ "$(awk '/SwapTotal/{print $2}' /proc/meminfo)" -eq 0 ]; then
 fi
 mark "swap: $(awk '/SwapTotal/{printf "%d MiB", $2/1024}' /proc/meminfo)"
 
-bucket=$(cat "$GS/bucket" 2>/dev/null || true)
 region=$(curl -sf -H "X-aws-ec2-metadata-token: $token" http://169.254.169.254/latest/meta-data/placement/region || echo eu-north-1)
+account=$(cat "$GS/account" 2>/dev/null || true)
+bucket=${account:+gamesummoner-models-$region-$account}
 S5=(s5cmd --log error --endpoint-url "http://s3.$region.amazonaws.com")
 sysctl -q vm.dirty_background_bytes=268435456 vm.dirty_bytes=1073741824
 ( t=$(date +%s); nvidia-smi -pm 1 > /dev/null 2>&1

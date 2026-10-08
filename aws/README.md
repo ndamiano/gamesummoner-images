@@ -239,7 +239,39 @@ Queue a job before the box is healthy or set `IDLE_EXIT_SECONDS` past the boot: 
 idle clock starts when it starts, not when the image turns healthy, so a box that boots into an
 empty queue with a short window exits on the spot (the scaler only launches on pending work, so
 production never sees this).
-Standing infrastructure, eu-north-1: bucket `gamesummoner-models-eu-north-1-<account>`,
-security group `gs-gpu-worker` (no inbound), S3 gateway endpoint `vpce-006e37cedf2225ed7`,
-role and instance profile `gs-gpu-worker` (S3 on the buckets, SSM). The scaler's EC2 client
-does not exist yet; every box so far was launched by hand.
+Standing infrastructure, per region: bucket `gamesummoner-models-<region>-<account>`
+(pack under `prepacked/`, the engine parts under `env/`), security group `gs-gpu-worker` (no
+inbound) in the default VPC, an S3 gateway endpoint on its route tables. Global: role and
+instance profile `gs-gpu-worker` (S3 on every `gamesummoner-models-*` bucket, SSM). A box
+knows its region from IMDS and its account from `/opt/gamesummoner/account` (written at
+provision), so one AMI copied with `copy-image` serves any region whose bucket holds the
+pack and its engine parts; nothing in the image names a region. Regions so far: eu-north-1
+(`vpce-006e37cedf2225ed7`), us-west-2 (`vpce-0bb567546d88e900f`). The scaler launches
+these boxes through its EC2 provider (`src/scaler/ec2_client.py` in the control plane repo):
+the env as user-data, by zone in the default VPC, the group and profile by name.
+
+Second region proved 2026-09-18: v15 (`ami-0116c8c4637c00e43`, copied to us-west-2 as
+`ami-0fe3c370e158967ca`) served a job from us-west-2c with no change but the region. What it
+cost to get there: pack and engine parts copied server-side in 8 min (the CLI's default ten
+8 MB part copies ran at 20 MB/s; 128 x 64 MB ran at ~300 MB/s), `copy-image` 28 min for the
+100 GB snapshot. A bake writes a new engine tarball under its own image id, so the tarball
+to copy is the one the copied AMI names in `/opt/gamesummoner/env-tar`, not the previous
+image's: the first us-west-2 box looped on `NoSuchKey` for 12 min until its parts arrived.
+Capacity: every us-west-2 zone refused g7e.2xlarge and g7e.4xlarge, spot and on-demand, from
+16:14 to 16:50 UTC (spot placement score 1 of 10, the same score eu-north-1 and us-east-1
+showed at that hour); us-west-2c then took a spot request. The pack restored at 1.6 GiB/s
+there (75.8 s against 40 s in eu-north-1) and the GPU init took 31 s against 19 s. A clean
+second launch two hours later (us-west-2c, spot after 5 min of refusals): job picked up 204 s
+after launch, engine ready at 212 s, no errors. Tarball 30 s, the same as eu-north-1; the
+pack streamed in 98 s (~1.3 GB/s against ~3 GB/s) and restored in 61.4 s, so the whole gap
+to 153 s is S3-to-box throughput on the pack. Two runs, one zone, a bucket hours old: a new
+bucket's prefixes scale up with use, so this may close on its own; if it does not, the knobs
+are `PACK_CONCURRENCY` and `PACK_WINDOW`.
+
+Region choice, 2026-09-18: nine regions offer g7e, two AZs each (us-west-2 four). Seven-day
+spot averages for g7e.2xlarge: eu-north-1a $1.16, us-west-2a $1.25, us-east-1d $1.58,
+ap-south-1b $1.66; the rest $1.9-2.8 and with a 5-vCPU G spot quota, below one box. The
+cheap zone of a region is the contended one (us-west-2a $1.25 against 2.4-3.4 in b, c, d),
+so a launch walks the zones of a region before the next region. Cross-region copy of the
+pack and engine parts is ~146 GB, about $3 in transfer, and a second bucket costs ~$3.40 a
+month at rest.

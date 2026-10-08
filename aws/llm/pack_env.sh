@@ -9,7 +9,9 @@ set -euo pipefail
 GS=/opt/gamesummoner
 NVME=/opt/dlami/nvme
 DIRS=(/opt/venv /opt/penny /usr/local/cuda-13.3 /root/.local/share/uv/python "$GS/cache")
-bucket=$(cat "$GS/bucket")
+imds_token=$(curl -sf -X PUT -H 'X-aws-ec2-metadata-token-ttl-seconds: 600' http://169.254.169.254/latest/api/token)
+region=$(curl -sf -H "X-aws-ec2-metadata-token: $imds_token" http://169.254.169.254/latest/meta-data/placement/region)
+bucket=gamesummoner-models-$region-$(cat "$GS/account")
 image_id=$(cat "$GS/image-id")
 key="env/llm-env-$image_id.parts"
 t0=$(date +%s)

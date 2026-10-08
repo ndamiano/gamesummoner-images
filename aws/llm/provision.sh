@@ -70,7 +70,7 @@ mkdir -p "$GS"
 find "$GS" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +
 aws s3 cp "$REPORT/tree.tar" - --only-show-errors | tar -x -C "$GS"
 chmod +x "$GS/entrypoint.sh"
-echo "$BUCKET" > "$GS/bucket"
+echo "$ACCOUNT" > "$GS/account"
 
 engine_stamp="$PENNY_REF $PYTHON_VERSION"
 if [ "$(cat /opt/penny/.gamesummoner-engine 2>/dev/null)" = "$engine_stamp" ] && [ -x /opt/venv/bin/sglang ]; then
