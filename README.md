@@ -30,7 +30,7 @@ first, and the MRO threads the chain, so the cell needs no code of its own.
 |---|---|---|---|---|---|
 | `local/server.py` | `local/llm/` | | | | `local/decide/` |
 | `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/video/` | `runpod/mesh/` | |
-| `aws/server.py` | `aws/llm/` | | | | |
+| `aws/server.py` | `aws/llm/` | | | | `aws/decide/` |
 
 A column sets two tuples: `capabilities`, the queue names a worker may pull for this box, and
 `kinds`, the payload kinds `/job` runs, which is what the worker sends as `type`. They differ

@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Turn a provisioned (and ideally end-to-end tested) builder into an AMI: bake.sh <instance id>
+# Turn a provisioned (and ideally end-to-end tested) builder into an AMI:
+# bake.sh <queue> <instance id>
 set -euo pipefail
 . "$(dirname "$0")/common.sh"
-instance=${1:?usage: bake.sh <instance id>}
+queue=${1:?usage: bake.sh <queue> <instance id>}
+instance=${2:?usage: bake.sh <queue> <instance id>}
 image_id=$(ssm_run "$instance" "cat /opt/gamesummoner/image-id")
-SSM_WAIT_SECONDS=1800 ssm_run "$instance" "systemctl stop gamesummoner-llm 2>/dev/null; pkill -TERM -fx 'bash /opt/gamesummoner/entrypoint.sh'; sleep 5; bash /opt/gamesummoner/aws/llm/pack_env.sh"
-ssm_run "$instance" "rm -f /etc/gamesummoner/env.json /var/log/gamesummoner-llm.log; rm -rf /opt/dlami/nvme/hf; cloud-init clean --logs; sync"
-name="gamesummoner-llm-$(date -u +%Y%m%dT%H%M%S)"
+SSM_WAIT_SECONDS=1800 ssm_run "$instance" "systemctl stop gamesummoner-$queue 2>/dev/null; pkill -TERM -fx 'bash /opt/gamesummoner/entrypoint.sh'; sleep 5; bash /opt/gamesummoner/aws/$queue/pack_env.sh"
+ssm_run "$instance" "rm -f /etc/gamesummoner/env.json /var/log/gamesummoner-$queue.log; rm -rf /opt/dlami/nvme/hf; cloud-init clean --logs; sync"
+name="gamesummoner-$queue-$(date -u +%Y%m%dT%H%M%S)"
 ami=$(ec2 create-image --instance-id "$instance" --name "$name" \
-    --description "GameSummoner llm box, image id $image_id" \
+    --description "GameSummoner $queue box, image id $image_id" \
     --tag-specifications "ResourceType=image,Tags=[{Key=gamesummoner-image-id,Value=$image_id}]" \
     --query ImageId --output text)
 echo "creating $ami ($name)"

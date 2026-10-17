@@ -1,4 +1,4 @@
-# Sourced by the aws/llm scripts: the region, the standing infrastructure, the pool walk.
+# Sourced by the aws scripts: the region, the standing infrastructure, the pool walk.
 REGION=${AWS_REGION:-eu-north-1}
 ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=gamesummoner-models-$REGION-$ACCOUNT

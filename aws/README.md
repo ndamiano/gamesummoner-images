@@ -9,6 +9,7 @@ empty: a box is decommissioned by ending its entrypoint, and the instance ends i
 | folder | queue | engine | instance |
 |---|---|---|---|
 | `llm/` | llm | Pennyroyal SGLang, Qwen3.8 Flash-Next NVFP4 | g7e.2xlarge (RTX PRO 6000 Server, 96 GB, 64 GiB host) |
+| `decide/` | decide | stock SGLang 0.5.21, JEV-27B-VL on Qwen3.8 27B NVFP4 | g7e.2xlarge |
 
 ## llm
 
@@ -219,13 +220,15 @@ instance's one-time request can hold the quota until it is cancelled
 
 ### Build, test, bake
 
+The scripts in `aws/` serve every box and take its queue first.
+
 ```
-aws/llm/build.sh [--base <ami>]      # builder up and provisioned (~5 min from the DLAMI, ~3 from --base)
-aws/llm/ssm.sh <instance> "echo $(base64 -w0 env.json) | base64 -d > /etc/gamesummoner/env.json; \
+aws/build.sh llm [--base <ami>]      # builder up and provisioned (~5 min from the DLAMI, ~3 from --base)
+aws/ssm.sh <instance> "echo $(base64 -w0 env.json) | base64 -d > /etc/gamesummoner/env.json; \
     GS_NO_POWEROFF=1 nohup setsid /opt/gamesummoner/entrypoint.sh > /var/log/gamesummoner-llm.log 2>&1 < /dev/null &"
-aws/llm/ssm.sh <instance> 'grep "^\[boot" /var/log/gamesummoner-llm.log'
-aws/llm/bake.sh <instance>           # once a job has gone through: the tarball to S3, then the AMI
-aws/llm/launch.sh <ami> env.json     # a box the way the scaler will start one
+aws/ssm.sh <instance> 'grep "^\[boot" /var/log/gamesummoner-llm.log'
+aws/bake.sh llm <instance>           # once a job has gone through: the tarball to S3, then the AMI
+aws/launch.sh llm <ami> env.json     # a box the way the scaler will start one
 ```
 
 On the builder the entrypoint is started by hand with `GS_NO_POWEROFF=1`, because the builder
@@ -246,7 +249,8 @@ instance profile `gs-gpu-worker` (S3 on every `gamesummoner-models-*` bucket, SS
 knows its region from IMDS and its account from `/opt/gamesummoner/account` (written at
 provision), so one AMI copied with `copy-image` serves any region whose bucket holds the
 pack and its engine parts; nothing in the image names a region. Regions so far: eu-north-1
-(`vpce-006e37cedf2225ed7`), us-west-2 (`vpce-0bb567546d88e900f`). The scaler launches
+(`vpce-006e37cedf2225ed7`), us-west-2 (`vpce-0bb567546d88e900f`), us-east-1
+(`vpce-09883550ad82c6d4f`, decide only so far). The scaler launches
 these boxes through its EC2 provider (`src/scaler/ec2_client.py` in the control plane repo):
 the env as user-data, by zone in the default VPC, the group and profile by name.
 
@@ -275,3 +279,36 @@ cheap zone of a region is the contended one (us-west-2a $1.25 against 2.4-3.4 in
 so a launch walks the zones of a region before the next region. Cross-region copy of the
 pack and engine parts is ~146 GB, about $3 in transfer, and a second bucket costs ~$3.40 a
 month at rest.
+
+## decide
+
+JEV-27B-VL's decision chains (`contract/decide.py`) on stock SGLang, the same engine, adapter split
+and launch line as `local/decide/`, so the boxes answer alike. Not the container: the local image
+is 46 GB, so `provision.sh` installs SGLang 0.5.21 natively into `/opt/venv` from `pins.txt`, the
+local image's `pip freeze`, installed whole (`-r`) and forced (`--overrides`). Installed from
+`sglang==0.5.21` alone, the venv imports on a box with a system CUDA and dies on the DLAMI
+(`libcupti.so.13`): the CUDA runtime wheels reach the image through `cuda-toolkit` extras, not
+torch's own requirements. `flashinfer-cubin` comes from flashinfer's root index, not its `cu130`
+one. The venv is 20 GB.
+
+`pack_env.sh` tars the venv, the CUDA 13.0 toolkit, the uv python and the kernel caches to
+`env/decide-env-<image id>.parts/`, and the entrypoint streams them back onto the NVMe the way the
+llm box does. Weights live in the bucket under `decide/<repo>@<revision>/`, plain files the
+builder copied from Hugging Face at provision; a box whose bucket lacks them pulls from Hugging
+Face instead. The entrypoint preps the decision head on every boot (`engines/jev/prep.py`, 2 s).
+
+The engine runs one request at a time (`--max-running-requests 1`, `WORKER_SLOTS` 1), for the
+reason in the top-level README.
+
+Measured 2026-10-16, us-east-1b: unit to engine files 27 s (24 GB), weights 20 s (23.9 GB), prep
+2 s, then the engine load; job claimed 134 s after EC2 `running`. The frog chain (22 steps) ran
+16.5 s and matched the builder's run of the same AMI exactly. Against the local 5090 every answer
+matched but the mechanics list, where four mechanics within 0.035 of the 0.6 line changed side.
+
+```
+aws/build.sh decide [--on-demand]
+aws/bake.sh decide <instance>
+aws/launch.sh decide <ami> env.json
+```
+
+AMIs: `ami-04366b4063158fcfe` (us-east-1).
