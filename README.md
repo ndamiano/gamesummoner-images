@@ -11,9 +11,11 @@ when it boots.
 | `contract/llm.py` | `LlmServer`: the llm queue against an OpenAI-compatible engine |
 | `contract/comfy.py`, `image.py`, `video.py` | `ComfyServer` and the two queues on ComfyUI: `ImageServer` (a workflow in, images out), `VideoServer` (a still in, a sprite sheet out via `anim_sheet.py`) |
 | `contract/mesh.py` | `MeshServer`: TRELLIS meshes and rendered sprite sheets |
+| `contract/decide.py` | `DecideServer`: a chain of JEV System 1 decisions, the decision head applied over SGLang's hidden states |
 | `contract/safety.py` | the NSFW verdict every rendered image carries |
-| `engines/` | inference servers we wrote ourselves: `trellis/` (TRELLIS.2), `sprites/` (kimodo sheets); ComfyUI and SGLang are upstream |
+| `engines/` | inference servers we wrote ourselves: `trellis/` (TRELLIS.2), `sprites/` (kimodo sheets), `jev/` (the JEV adapter split for SGLang); ComfyUI and SGLang are upstream |
 | `local/llm/` | the llm box for a local 5090: stock SGLang serving Qwen3.8 27B NVFP4 |
+| `local/decide/` | the decide box for a local 5090: stock SGLang serving JEV-27B-VL on Qwen3.8 27B NVFP4 |
 | `runpod/` | the RunPod boxes, one per queue: [runpod/README.md](runpod/README.md) |
 | `aws/` | the EC2 boxes, an AMI per queue: [aws/README.md](aws/README.md) |
 
@@ -24,11 +26,11 @@ The contract servers form a grid. `contract/server.py` is the corner; a queue's
 class extends the command line by overriding `add_arguments` and `__init__` and calling super
 first, and the MRO threads the chain, so the cell needs no code of its own.
 
-|  | `contract/llm.py` | `contract/image.py` | `contract/video.py` | `contract/mesh.py` |
-|---|---|---|---|---|
-| `local/server.py` | `local/llm/` | | | |
-| `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/video/` | `runpod/mesh/` |
-| `aws/server.py` | `aws/llm/` | | | |
+|  | `contract/llm.py` | `contract/image.py` | `contract/video.py` | `contract/mesh.py` | `contract/decide.py` |
+|---|---|---|---|---|---|
+| `local/server.py` | `local/llm/` | | | | `local/decide/` |
+| `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/video/` | `runpod/mesh/` | |
+| `aws/server.py` | `aws/llm/` | | | | |
 
 A column sets two tuples: `capabilities`, the queue names a worker may pull for this box, and
 `kinds`, the payload kinds `/job` runs, which is what the worker sends as `type`. They differ
@@ -102,7 +104,21 @@ cd ai-agent-test/src
 checkpoint.
 
 Tests: `python -m pytest tests`. The contract tests need only the standard library; the
-anim-sheet, sprites3d and video tests also need numpy and Pillow and skip without them.
+anim-sheet, sprites3d and video tests also need numpy and Pillow, the decide tests numpy and
+safetensors, and they skip without them.
+
+## Local decide box
+
+Same shape as the llm box: `local/decide/build.sh`, then `local/decide/run.sh env.json` with
+`WORKER_QUEUE=decide`. Boot pulls `autotrust/JEV-27B-VL` and `unsloth/Qwen3.8-27B-NVFP4` at pinned
+revisions, and `engines/jev/prep.py` splits the adapter: SGLang loads the backbone LoRA, and
+`contract/decide.py` applies the lm_head part as the decision head over the returned hidden state,
+because SGLang cannot run a LoRA over that checkpoint's FP8 lm_head.
+
+The engine runs one request at a time (`--max-running-requests 1`, `WORKER_SLOTS=1`). Two
+sequences batched together with the LoRA and hidden states on moved JEV's probabilities by up to
+0.05 against the same question asked alone, so an answer depended on what else was in flight.
+Serial reads take about 68 ms each, warm.
 
 ## RunPod boxes
 
