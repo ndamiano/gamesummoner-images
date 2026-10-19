@@ -1,13 +1,12 @@
 #!/usr/bin/env bash
-# Runs as root on the builder instance (from build.sh's user-data): the toolchain, Pennyroyal
-# from source, the contract server and the worker, the systemd unit. Reports to
+# Runs as root on the builder instance (from build.sh's user-data): the toolchain, Basalt from
+# the pinned fork tag, the contract server and the worker, the systemd unit. Reports to
 # s3://$BUCKET/build/$BUILD_ID/. Why each step: aws/README.md.
 set -euo pipefail
 
 : "${BUCKET:?}" "${BUILD_ID:?}"
-PENNY_REPO=https://github.com/ndamiano/sglang-rtxpro6000
-PENNY_REF=pennyroyal-v2.1.0-prepacked1
-PYTHON_VERSION=3.12.13
+BASALT_REPO=https://github.com/ndamiano/basalt
+BASALT_REF=gamesummoner-v1
 CUDA_VERSION=13.3
 GS=/opt/gamesummoner
 LOG=/var/log/gamesummoner-provision.log
@@ -26,11 +25,8 @@ export DEBIAN_FRONTEND=noninteractive
 mark "ubuntu $(. /etc/os-release && echo "$VERSION_ID"), $(nvidia-smi --query-gpu=name,driver_version --format=csv,noheader 2>/dev/null | head -1 || echo 'no gpu')"
 
 apt-get update -q
-apt-get install -y -q --no-install-recommends software-properties-common
-add-apt-repository -y ppa:ubuntu-toolchain-r/test
-apt-get update -q
 apt-get install -y -q --no-install-recommends \
-    ca-certificates curl git gcc-15 g++-15 libnuma-dev ninja-build cmake python3-pip
+    ca-certificates curl git build-essential cmake python3-venv
 mark "toolchain installed"
 
 if [ ! -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]; then
@@ -41,8 +37,7 @@ if [ ! -x "/usr/local/cuda-$CUDA_VERSION/bin/nvcc" ]; then
     apt-get install -y -q --no-install-recommends "cuda-toolkit-${CUDA_VERSION/./-}"
 fi
 mark "cuda $("/usr/local/cuda-$CUDA_VERSION/bin/nvcc" --version | grep -o 'release [0-9.]*')"
-export CUDA_HOME=/usr/local/cuda-$CUDA_VERSION CC=/usr/bin/gcc-15 CXX=/usr/bin/g++-15 CUDAHOSTCXX=/usr/bin/g++-15
-export PATH=/opt/venv/bin:$CUDA_HOME/bin:/root/.local/bin:$PATH
+export CUDA_HOME=/usr/local/cuda-$CUDA_VERSION PATH=/usr/local/cuda-$CUDA_VERSION/bin:$PATH
 
 systemctl disable --now docker.service docker.socket containerd.service soci-snapshotter.service \
     nvidia-fabricmanager.service nvidia-cdi-refresh.service nvidia-cdi-refresh.path \
@@ -63,38 +58,28 @@ grep -l 'efa\|ib_core' /etc/modules-load.d/*.conf 2>/dev/null | xargs -r rm -f |
 systemctl enable snapd.apparmor.service 2>/dev/null || true
 curl -fsSL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
     | tar -xz -C /usr/local/bin s5cmd
+curl -fsSL https://github.com/peak/s5cmd/releases/download/v2.3.0/s5cmd_2.3.0_Linux-64bit.tar.gz \
+    | tar -xz -C /usr/local/bin s5cmd
 mark "boot services trimmed, s5cmd $(s5cmd version)"
 
 mkdir -p "$GS"
-[ -f "$GS/env-tar" ] && mv "$GS/env-tar" /root/env-tar.previous
-find "$GS" -mindepth 1 -maxdepth 1 ! -name cache -exec rm -rf {} +
+find "$GS" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 aws s3 cp "$REPORT/tree.tar" - --only-show-errors | tar -x -C "$GS"
 chmod +x "$GS/entrypoint.sh"
 echo "$ACCOUNT" > "$GS/account"
 
-engine_stamp="$PENNY_REF $PYTHON_VERSION"
-if [ "$(cat /opt/penny/.gamesummoner-engine 2>/dev/null)" = "$engine_stamp" ] && [ -x /opt/venv/bin/sglang ]; then
-    git -C /opt/penny checkout -- .
-    git -C /opt/penny apply "$GS/aws/llm/prepacked-parts.patch"
-    mark "engine kept: $engine_stamp, patch re-applied"
+engine_stamp="$BASALT_REF"
+if [ "$(cat /opt/basalt/.gamesummoner-engine 2>/dev/null)" = "$engine_stamp" ] && [ -x /opt/basalt/bin/basalt ]; then
+    mark "engine kept: $engine_stamp"
 else
-    pip install --break-system-packages -q uv
-    rm -rf /opt/penny
-    git clone --depth 1 -b "$PENNY_REF" "$PENNY_REPO" /opt/penny
-    git -C /opt/penny apply "$GS/aws/llm/prepacked-parts.patch"
-    mark "fork at $(git -C /opt/penny rev-parse --short HEAD), patched"
-
-    uv python install "$PYTHON_VERSION"
-    rm -rf /opt/venv "$GS/cache"
-    uv venv --python "$PYTHON_VERSION" /opt/venv
-    . /opt/venv/bin/activate
-    uv pip install setuptools wheel packaging wheel_stub
-    (cd /opt/penny && uv pip install --prerelease=allow --index-strategy unsafe-best-match \
-        --extra-index-url https://docs.sglang.ai/whl/cu130/ --no-build-isolation -e python)
-    uv pip install hf_transfer huggingface_hub requests
-    uv cache clean
-    echo "$engine_stamp" > /opt/penny/.gamesummoner-engine
-    mark "engine installed: sglang $(python -c 'import sglang; print(sglang.__version__)'), torch $(python -c 'import torch; print(torch.__version__)')"
+    rm -rf /opt/basalt
+    git clone --depth 1 -b "$BASALT_REF" "$BASALT_REPO" /opt/basalt
+    cmake -S /opt/basalt -B /opt/basalt/build -DCMAKE_BUILD_TYPE=Release
+    cmake --build /opt/basalt/build -j"$(nproc)"
+    python3 -m venv /opt/basalt/.venv
+    /opt/basalt/.venv/bin/pip install -q -r /opt/basalt/requirements.txt "requests>=2.31"
+    echo "$engine_stamp" > /opt/basalt/.gamesummoner-engine
+    mark "basalt $(git -C /opt/basalt rev-parse --short HEAD) built"
 fi
 
 cp "$GS/aws/llm/gamesummoner-llm.service" /etc/systemd/system/
@@ -116,6 +101,6 @@ touch /etc/cloud/cloud-init.disabled
 mark "box code at $GS, image id $(cat "$GS/image-id"), worker $(cat "$GS/worker/ref")"
 
 apt-get clean
-rm -rf /root/.cache/pip /root/.cache/uv /tmp/cuda-keyring.deb
+rm -rf /root/.cache/pip /tmp/cuda-keyring.deb
 mark "provisioned"
 report ok

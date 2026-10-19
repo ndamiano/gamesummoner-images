@@ -6,7 +6,7 @@ set -euo pipefail
 queue=${1:?usage: bake.sh <queue> <instance id>}
 instance=${2:?usage: bake.sh <queue> <instance id>}
 image_id=$(ssm_run "$instance" "cat /opt/gamesummoner/image-id")
-SSM_WAIT_SECONDS=1800 ssm_run "$instance" "systemctl stop gamesummoner-$queue 2>/dev/null; pkill -TERM -fx 'bash /opt/gamesummoner/entrypoint.sh'; sleep 5; bash /opt/gamesummoner/aws/$queue/pack_env.sh"
+SSM_WAIT_SECONDS=1800 ssm_run "$instance" "systemctl stop gamesummoner-$queue 2>/dev/null; pkill -TERM -fx 'bash /opt/gamesummoner/entrypoint.sh'; sleep 5; f=/opt/gamesummoner/aws/$queue/pack_env.sh; [ ! -f \$f ] || bash \$f"
 ssm_run "$instance" "rm -f /etc/gamesummoner/env.json /var/log/gamesummoner-$queue.log; rm -rf /opt/dlami/nvme/hf; cloud-init clean --logs; sync"
 name="gamesummoner-$queue-$(date -u +%Y%m%dT%H%M%S)"
 ami=$(ec2 create-image --instance-id "$instance" --name "$name" \

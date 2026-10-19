@@ -120,6 +120,6 @@ Serial reads take about 68 ms each, warm.
 ## RunPod boxes
 
 `runpod/` holds the two RunPod images (llm, comfy) ported onto the contract.
-Everything about them that needs a why (the llm engine tarball on the volume, the prepacked
-checkpoint, weight staging on the ComfyUI box, boot orders, build
+Everything about them that needs a why (the llm pack served off the volume, weight staging on
+the ComfyUI box, boot orders, build
 and ship, volume layouts) is in [runpod/README.md](runpod/README.md).

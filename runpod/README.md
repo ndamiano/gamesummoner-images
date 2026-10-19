@@ -8,11 +8,11 @@ terminate.
 
 | folder | queue | engine | card |
 |---|---|---|---|
-| `llm/` | llm | Pennyroyal SGLang, Qwen3.8 Flash-Next | RTX PRO 6000 |
+| `llm/` | llm | Basalt, Qwen3.8 Flash-Next | RTX PRO 6000 |
 | `comfy/` | comfy | ComfyUI: images and TRELLIS.2 meshes | 5090 / RTX PRO 4500 |
 
 Every pod gets the same env from the scaler (`CP_URL`, `WORKER_TOKEN`, `WORKER_QUEUE`,
-`IDLE_EXIT_SECONDS`, plus the llm's `LLM_*`, `SGLANG_ARGS_EXTRA`, `WORKER_SLOTS`) and its
+`IDLE_EXIT_SECONDS`, plus the llm's `LLM_*`, `BASALT_ARGS_EXTRA`, `WORKER_SLOTS`) and its
 worker id as the pod's args (`--worker-id <id>`); every entrypoint writes those to
 `/etc/gamesummoner/env.json` for the worker. Every engine binds `127.0.0.1` and nothing is
 exposed: a reachable inference server is an unauthenticated GPU. Every template's env is the
@@ -22,7 +22,7 @@ bump the tag on every push, because RunPod caches images per host.
 Two volumes, because a volume pins its datacenter: the **art volume** (EU-RO-1, 5090-class
 hosts; `runpod.network_volume_id` in the control plane) holds the ComfyUI
 weights, and the **llm volumes** (one per datacenter the RTX PRO 6000 is in;
-`queues.llm.network_volume_ids`) hold the checkpoint and the engine tarball. `provision_volume.sh`
+`queues.llm.network_volume_ids`) hold the Basalt pack. `provision_volume.sh`
 is the authority on the art volume: run it on any cheap pod with the volume mounted, no GPU
 touched, and it pulls every weight from Hugging Face at datacenter bandwidth, idempotently.
 The NSFW classifier at `comfy/models/safety/` (`model.pt` + `config.json`) is not in it: the
@@ -82,91 +82,42 @@ runpod/comfy/build.sh ndamiano100/gamesummoner-images:comfy-runpod-v1
 
 ## llm
 
-Qwen3.8 Flash-Next NVFP4 on the 96 GB RTX PRO 6000 (SM120), served by Pennyroyal, jpezzulli's
-SGLang fork for that card, at a pinned tag on our fork (`ndamiano/sglang-rtxpro6000`) that adds
-the prepacked loader. It is the only stack measured to serve Flash-Next on that card with
-vision, tool calls and a clean reasoning split (2026-09-02: 203 tok/s short-context decode,
-~100 at 54K). Both editions of the card are in `queues.llm.gpu_type_ids`, Workstation first
-(faster, more expensive, EU-RO-1 mostly); `allowed_cuda_versions: ["13.0"]` is the driver floor
-the CUDA 13 wheels need, and a pod on an older driver is dead on any card until the boot
-deadline reaper collects it.
+Qwen3.8 Flash-Next on the 96 GB RTX PRO 6000 (SM120), served by Basalt from our fork
+(`ndamiano/basalt`) at the tag `gamesummoner-v1`: upstream `jesdga95/basalt` plus local
+commits, among them a resident-expert batch-doorbell fix in `src/core/verify.cpp`. Basalt builds
+for compute capability 12.0 only. Both editions of the card are in `queues.llm.gpu_type_ids`,
+Workstation first (faster, more expensive, EU-RO-1 mostly); `allowed_cuda_versions: ["13.0"]` is
+the driver floor the CUDA 13 runtime needs, and a pod on an older driver is dead on any card
+until the boot deadline reaper collects it.
 
-### The image is the toolchain; the engine rides the volume
+### The image is the engine; the pack rides the volume
 
-The Dockerfile has three stages.
+The Dockerfile has two stages. The builder (`nvidia/cuda:13.3.1-devel-ubuntu24.04`) clones the
+fork at the tag, builds it with cmake in Release, and makes the venv at `/opt/basalt/.venv` with
+Basalt's requirements and `requests` (Basalt's binary runs `<source>/.venv/bin/python`). The
+runtime stage (`nvidia/cuda:13.3.1-runtime-ubuntu24.04`) takes `/opt/basalt` from it, plus the
+contract server, the worker and the image id. The image is 4.7 GB, pushed as
+`ndamiano100/gamesummoner-images:llm-basalt-runpod-v1`; template `2b7rhfi08k` ("LLM Worker
+(Basalt)") names it, with a 50 GB container disk and the registry auth.
 
-- `builder` installs the fork, its venv (python 3.12.13 via uv, `--no-build-isolation` so the
-  cuda-tile sdist sees the venv), and the sm120 kernel caches, then tars all of it into
-  `/env.tar` and writes its sha256 prefix to `/env.id`.
-- `env` is `FROM scratch` holding only those two files. `build.sh --env` dumps this stage to
-  `runpod/llm/out/` instead of making an image.
-- The runtime stage is the CUDA base plus what the JIT link line needs (nvcc, gcc-15, ninja,
-  cmake, the CUDA dev headers), the contract server, the worker, and `env.id`. Nothing else.
-
-Why: the venv, fork checkout and kernel caches are ~10 GB of mostly CUDA libraries that do not
-compress. As image layers they cost 90-120 s on every host that had not seen the tag, and
-RunPod caches per host. Off the volume, `tar -xf` of one uncompressed file is a sequential read
-at volume speed (~200 MB/s measured). Cold create-to-serving measured 205 s, warm 110 s
-(2026-09-03).
-
-The id ties the two artifacts. The runtime stage is built against that exact venv: its CUDA
-libraries are symlinks into `/opt/venv/.../nvidia/cu13/lib/`, a path that only exists after
-restore. The entrypoint restores `env/llm-env-<id>.tar` and refuses to boot when it is not on
-the volume, so an image and a tarball from different builds never meet, and the mismatch fails
-at second zero with a clear message instead of minutes in with a CUDA error. Every llm volume
-(one per datacenter, volumes pin their datacenter) must hold the tarball before the template
-moves to the tag.
-
-A container restarted in place skips the restore: `/opt/venv/bin/python` is already there.
-
-### Kernel caches
-
-`penny_cache_v6.tgz` is a build input, not source: the FlashInfer/torchinductor/triton caches
-captured from the trial pod, plus the serve script and the NIXL config. It lives at
-`s3://<llm-volume>/fastboot/` and is fetched into `runpod/llm/` before a build (`build.sh`
-checks). Two things the Dockerfile does with it:
-
-- **gcc-15 identity.** The fork pins the JIT identity to gcc-15; a different host compiler
-  silently invalidates every baked kernel and the pod re-tunes for ~300 s.
-- **AOT promotion.** FlashInfer's JIT trusts only its AOT directory without rebuilding; the
-  tarred JIT directory re-ninjas on every fresh container. The `builder` stage copies each
-  compiled `.so` into the AOT tree.
-
-HiCache/NIXL are stripped from the serve script: the nixl wheel's backend fails to create.
-Persistence returns when a from-source NIXL earns it.
+The weights are one Basalt pack, `Qwen3.8-FN-UD-Q4_K_XL-bf16key-mtptuned.basalt` (106.8 GiB),
+served straight from the llm volume at `/workspace/models/basalt/<pack>` (`BASALT_PACK` in the
+image env).
 
 ### The volume
 
 | path | what |
 |---|---|
-| `models/pennyroyal/` | the checkpoint: `config.json`, one safetensors shard, the index, and `prepacked/` |
-| `env/llm-env-<id>.tar` | the engine tarball for the image the template names |
-| `fastboot/penny_cache_v6.tgz` | the build input above |
+| `models/basalt/Qwen3.8-FN-UD-Q4_K_XL-bf16key-mtptuned.basalt` | the pack |
 
-The checkpoint is **prepacked**. `RadixArk/Qwen3.8-Flash-Next-NVFP4` (126 GiB) loads through a
-CPU-bound repack pass, ~110 s on a fresh pod, NVMe or not. The fork's `--load-format prepacked`
-restores the post-repack state from one flat file in 20-55 s. The safetensors shards are gone
-from the volume except one, because the 142 GB quota holds one copy, not two, and the fork's
-namespace helper raises on a checkpoint with zero shards. The pack's key is the load layout
-(quantization backends, tp, config hash), not the path, so a second volume in another
-datacenter is a copy, not a re-dump. Keep the `.cache/huggingface` metadata the download
-wrote, or the namespace helper hashes every byte.
+The llm volumes are `juqk1aq0ew` (EU-RO-1) and `szjxc7ha34` (US-NC-2).
 
-How to populate a new llm volume (worked 2026-09-02, 130 GB in 9 minutes for $0.04 of CPU pod):
-
-1. `hf download` the checkpoint to `models/pennyroyal/` on any pod with the volume mounted,
-   then delete every shard but one plus the index over the volume's S3 endpoint.
-2. Rent a CPU pod in the new volume's datacenter, `truncate` the pack file to its final size
-   on the mount, and have 16 workers each `get-object --range` a 100 MB piece from the old
-   volume's S3 endpoint and `dd … seek=` it into place (~215 MB/s).
-
-What does not work: shards and pack on the volume at once (a full volume fails every write
-silently, the mount reports nothing, the S3 gateway keeps answering stale sizes); writing the
-pack through the S3 gateway (~15 MB/s single stream, 413 over ~128 MB parts, 524 at 48
-concurrent parts, lost parts by `CompleteMultipartUpload`); a GPU pod loading the shards off
-the volume to dump a fresh pack (dies to the container cgroup; stage to NVMe first). A pod
-launched by hand must not be named `maestro-<queue>-…`: the scaler reaps a pod under its prefix
-that never registers a worker.
+A pack goes onto a new volume from a CPU pod in its datacenter: `truncate` the file to its final
+size on the mount, and have 16 workers each `get-object --range` a 100 MB piece from another
+volume's S3 endpoint and `dd … seek=` it into place (~215 MB/s, measured 2026-09-02). Writing it
+through the S3 gateway does not work: ~15 MB/s single stream, 413 over ~128 MB parts, 524 at 48
+concurrent parts, lost parts by `CompleteMultipartUpload`. A pod launched by hand must not be
+named `maestro-<queue>-…`: the scaler reaps a pod under its prefix that never registers a worker.
 
 S3 access: the bucket name is the volume id, the region/endpoint pair is the datacenter.
 
@@ -182,28 +133,27 @@ A large `cp` can end in `InvalidPart … N parts missing` with the object alread
 
 `entrypoint.sh`, in order.
 
-1. **Guards.** `LLM_MODEL` must be `pennyroyal` and `LLM_N_CTX` at most 524288: the serve
-   script bakes the served-model-name and the window, a request naming another model is
-   refused, and a budget past the window is a prompt the engine rejects. Both are contracts the
-   control plane's settings state, so a mismatch dies here rather than on the first turn.
+1. **Guards.** `CP_URL`, `WORKER_TOKEN`, `LLM_MODEL` and `LLM_N_CTX` are set, and `LLM_N_CTX` is
+   at most 262144: a budget past the engine window is a prompt the engine rejects, so a mismatch
+   dies here rather than on the first turn.
 2. **Worker id.** The scaler passes it as the pod's args (`--worker-id <id>`); a template can
    set `WORKER_ID` in the env instead.
-3. **Engine restore** from the volume, as above.
+3. **Pack.** The pod refuses to boot when the pack is not at `BASALT_PACK`.
 4. **Env file.** The scaler's env (`CP_URL`, `WORKER_TOKEN`, `WORKER_QUEUE`,
-   `IDLE_EXIT_SECONDS`, `LLM_MODEL`, `LLM_N_CTX`, `SGLANG_ARGS_EXTRA`, `WORKER_SLOTS`) plus the
+   `IDLE_EXIT_SECONDS`, `LLM_MODEL`, `LLM_N_CTX`, `BASALT_ARGS_EXTRA`, `WORKER_SLOTS`) plus the
    worker id become `/etc/gamesummoner/env.json`, which the worker reads.
-5. **Engine launch** through `/root/serve-nohicache.sh` from the tarball, the only launch that
-   fits the card: it offloads the PLE table to host RAM (`--ple-offload-embedding`; without it
-   the weights alone exceed 96 GB), applies the YaRN rope override, and sets the qwen3
-   reasoning and tool-call parsers a build turn depends on. `SGLANG_ARGS_EXTRA` is the control
-   plane's `llm.sglang_args`, delivered at create, so a tuning flag is a settings edit and the
-   next pod, never a new tag. It is placed between `--load-format prepacked` and the
-   `--cuda-graph-bs` list (one entry per worker slot) so the image's own invariants win. A flag
-   that changes the FlashInfer autotune key costs one ~300 s re-tune per pod; measure it on one
-   pod first. Three attempts: the first launch OOM-SIGKILLs under the 188 GB container cgroup
-   about half the time (mmap'd checkpoint plus PLE offload plus load buffers) and a relaunch
-   reliably loads. The contract server starts after the engine holds, so the pid it watches is
-   the one that serves.
+5. **Engine**: `basalt serve --config <json> --alias $LLM_MODEL --host 127.0.0.1 --port 8001
+   --parallel $WORKER_SLOTS` plus `BASALT_ARGS_EXTRA`. The entrypoint writes the config: engine
+   `expert-cache` auto, `prefill` auto, `spec` 7, `spec-min-p` 0.5, `kv` int8,
+   `vram-reserve-mib` 700, `resident-experts` true, `max-context` 262144,
+   `conversation-cache-mib` 32000, `conversation-cache-slots` 16; server `vision` dynamic,
+   `fit-max-tokens` true. The engine answers to whatever name `LLM_MODEL` gives it.
+   `BASALT_ARGS_EXTRA` is the control plane's `llm.basalt_args`, delivered at create, so a
+   tuning flag is a settings edit and the next pod, never a new tag. `WORKER_SLOTS` is 1 in
+   production: Basalt reuses a slot only on an exact prefix match, an agent's next turn never
+   matches one, so with `--parallel` above 1 it re-reads the whole conversation every turn.
+   Builds sharing a box take turns on the one slot; conversation parking restores each build's
+   conversation in 0.3–0.5 s when its turn comes.
 6. **Contract server** (`python -m runpod.llm.server`) and **worker** (baked at
    `worker.ref`), side by side. The engine binds `127.0.0.1` and the worker dials out, so the
    pod exposes no port: an llm server reachable from the internet is an unauthenticated GPU.
@@ -217,16 +167,11 @@ the guarantee. No pod carries a RunPod API key for that reason.
 ### Build and ship
 
 ```
-runpod/llm/build.sh ndamiano100/gamesummoner-images:llm-runpod-v1 --env
-aws s3 cp --profile runpod --region <dc> --endpoint-url https://s3api-<dc>.runpod.io \
-    runpod/llm/out/env.tar s3://<llm-volume>/env/llm-env-$(cat runpod/llm/out/env.id).tar
-docker push ndamiano100/gamesummoner-images:llm-runpod-v1
+runpod/llm/build.sh ndamiano100/gamesummoner-images:llm-basalt-runpod-v1
+docker push ndamiano100/gamesummoner-images:llm-basalt-runpod-v1
 ```
 
-- `--env` only when the `builder` stage's inputs changed (fork tag, the cache tarball, pip
-  deps) or the layer cache is cold; a code-only rebuild reuses the cached tarball and keeps its
-  id. The export streams through `$DOCKER_TMPDIR` (default `/tmp`) at its full ~10 GB.
-- Upload the tarball to every llm volume before moving the template to the tag.
+- Every llm volume holds the pack before the template moves to the tag.
 - Bump the tag on every push: RunPod caches images per host, and re-pushing a tag leaves stale
   copies serving on warm hosts.
 - The Docker Hub repo is private, so the template carries the registry auth; without it a pod
