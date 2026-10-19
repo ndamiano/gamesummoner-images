@@ -14,6 +14,7 @@ from safetensors.numpy import load_file, save_file  # noqa: E402
 from contract import server  # noqa: E402
 from contract.decide import choose, run_chain  # noqa: E402
 from local.decide.server import LocalDecideServer  # noqa: E402
+from runpod.decide.server import RunpodDecideServer  # noqa: E402
 from support import call, health_becomes, sleeper  # noqa: E402
 
 
@@ -150,12 +151,12 @@ class FakeSglang:
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
 
 
-@pytest.fixture
-def box(monkeypatch, jev_dir):
+@pytest.fixture(params=[LocalDecideServer, RunpodDecideServer], ids=["local", "runpod"])
+def box(request, monkeypatch, jev_dir):
     monkeypatch.setattr(server, "PROBE_INTERVAL_SECONDS", 0.01)
     engine = FakeSglang(lambda text: [1.0, -1.0, 0.5, 0.0] if "jump" in text else [0.0, 1.0, 0.0, 2.0])
     engine_proc, entrypoint_proc = sleeper(), sleeper()
-    image = LocalDecideServer.from_argv([
+    image = request.param.from_argv([
         "--image-id", "img-1", "--engine-url", engine.url, "--jev-dir", str(jev_dir),
         "--engine-pid", str(engine_proc.pid), "--entrypoint-pid", str(entrypoint_proc.pid),
         "--port", "0"])
