@@ -8,7 +8,7 @@ POLL_TIMEOUT_SECONDS = 600
 
 class ImageServer(ComfyServer):
     capabilities = ("image",)
-    kinds = ("comfy_image",)
+    kinds = ("comfy_image", "comfy_mesh")
 
     def warmup_workflow(self) -> dict:
         return {
@@ -48,6 +48,12 @@ class ImageServer(ComfyServer):
             return 502, {"status": "failed", "error": str(e)}
         except KeyError as e:
             return 500, {"status": "failed", "error": f"payload missing {e}"}
-        images = [{"filename": name, "b64": base64.b64encode(data).decode("ascii"),
-                   "safety": safety.classify(data)} for name, data in outputs]
-        return 200, {"status": "succeeded", "result": {"prompt_id": prompt_id, "images": images}}
+        result = {"prompt_id": prompt_id, "images": []}
+        for name, data in outputs:
+            if name.endswith(".glb"):
+                result["glb_b64"] = base64.b64encode(data).decode("ascii")
+            else:
+                result["images"].append({"filename": name,
+                                         "b64": base64.b64encode(data).decode("ascii"),
+                                         "safety": safety.classify(data)})
+        return 200, {"status": "succeeded", "result": result}

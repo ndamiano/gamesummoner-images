@@ -69,7 +69,7 @@ class ComfyClient:
     def outputs(self, history: dict) -> list:
         out = []
         for node_output in (history.get("outputs") or {}).values():
-            for img in node_output.get("images", []):
+            for img in node_output.get("images", []) + node_output.get("3d", []):
                 query = urllib.parse.urlencode({"filename": img["filename"],
                                                 "subfolder": img.get("subfolder", ""),
                                                 "type": img.get("type", "output")})

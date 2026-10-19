@@ -6,7 +6,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git curl \
 
 ENV PIP_BREAK_SYSTEM_PACKAGES=1
 
-ARG COMFY_SHA=0764232429b8cfb10b79b6f186c8cb23e0b22897
+ARG COMFY_SHA=3c1b7a17fdf239d35ce98cc777756f572d089795
 RUN git init /opt/ComfyUI \
     && cd /opt/ComfyUI \
     && git remote add origin https://github.com/comfyanonymous/ComfyUI \

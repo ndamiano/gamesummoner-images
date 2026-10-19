@@ -1,4 +1,4 @@
-"""The image column on ComfyUI: warm before serving, one workflow in, images with verdicts out."""
+"""The ComfyUI box: warm before serving, one workflow in, images with verdicts or a GLB out."""
 
 import base64
 
@@ -36,7 +36,7 @@ def test_health_is_503_until_the_warmup_render_has_run(box):
 
 def test_metadata_names_the_queue_and_the_kind_separately(box):
     assert call(box["url"], "GET", "/metadata")[1]["capabilities"] == ["image"]
-    assert box["image"].kinds == ("comfy_image",)
+    assert box["image"].kinds == ("comfy_image", "comfy_mesh")
 
 
 def test_a_workflow_runs_with_its_uploads_landed_first(box):
@@ -54,6 +54,19 @@ def test_a_workflow_runs_with_its_uploads_landed_first(box):
     assert result["images"][0]["safety"] == {"scores": {"NSFW": 0.01}}
     assert b"INIT" in box["comfy"].uploads["init.png"]
     assert box["comfy"].prompts[result["prompt_id"]] == {"1": {"class_type": "X", "inputs": {}}}
+
+
+def test_a_mesh_workflow_returns_its_glb_and_no_images(box):
+    box["comfy"].up = True
+    health_becomes(box["url"], 200)
+    box["comfy"].images = lambda wf: [("run_00001_.glb", b"glTF")]
+    status, body = call(box["url"], "POST", "/job", {
+        "jobId": "j1", "type": "comfy_mesh",
+        "payload": {"kind": "comfy_mesh", "workflow": {"1": {"class_type": "X", "inputs": {}}},
+                    "uploads": [{"name": "subject.png", "b64": base64.b64encode(b"PNG").decode()}]}})
+    assert status == 200
+    assert base64.b64decode(body["result"]["glb_b64"]) == b"glTF"
+    assert body["result"]["images"] == []
 
 
 def test_a_refused_workflow_is_a_502_with_comfys_reason(box):

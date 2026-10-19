@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Populate a RunPod network volume with every model weight the three GPU queues load.
+# Populate a RunPod network volume with every model weight the ComfyUI box loads.
 #
 # Run this ON a pod with the volume mounted at $VOL (default /workspace). Any cheap pod will do —
 # this phase is pure download, no GPU touched. Downloads come from HuggingFace at datacenter
@@ -40,12 +40,12 @@ export HF_HOME="$VOL/hf-cache"
 
 mkdir -p "$VOL/comfy/models/checkpoints" \
          "$VOL/comfy/models/diffusion_models" "$VOL/comfy/models/text_encoders" \
-         "$VOL/comfy/models/vae" \
-         "$VOL/comfy/models/RMBG/BiRefNet" "$VOL/trellis2-weights" "$VOL/hf-cache"
+         "$VOL/comfy/models/vae" "$VOL/comfy/models/clip_vision" \
+         "$VOL/comfy/models/RMBG/BiRefNet" "$VOL/hf-cache"
 
 "$PY" - "$VOL" <<'PY'
 import os, shutil, sys
-from huggingface_hub import hf_hub_download, snapshot_download
+from huggingface_hub import hf_hub_download
 
 VOL = sys.argv[1]
 
@@ -73,6 +73,14 @@ FILES = [
     (f"{VOL}/comfy/models/RMBG/BiRefNet", "1038lab/BiRefNet", "birefnet.py", 0, None),
     (f"{VOL}/comfy/models/RMBG/BiRefNet", "1038lab/BiRefNet", "BiRefNet_config.py", 0, None),
     (f"{VOL}/comfy/models/RMBG/BiRefNet", "1038lab/BiRefNet", "config.json", 0, None),
+    (f"{VOL}/comfy/models/diffusion_models", "Comfy-Org/TRELLIS.2",
+     "diffusion_models/trellis_2_bf16.safetensors", 10338297616, None),
+    (f"{VOL}/comfy/models/vae", "Comfy-Org/TRELLIS.2",
+     "vae/trellis_2_shape_vae_bf16.safetensors", 1095844024, None),
+    (f"{VOL}/comfy/models/vae", "Comfy-Org/TRELLIS.2",
+     "vae/trellis_2_texture_vae_bf16.safetensors", 948461364, None),
+    (f"{VOL}/comfy/models/clip_vision", "Comfy-Org/TRELLIS.2",
+     "clip_vision/dino_v3_vit_l.safetensors", 1212559776, None),
 ]
 
 for dest, repo, name, want, rev, *stored in FILES:
@@ -91,27 +99,6 @@ for dest, repo, name, want, rev, *stored in FILES:
         sys.exit(f"SIZE MISMATCH {name}: got {got}, expected {want} — wrong repo or a bad pull")
     print(f"ok            {name}  ({got/1e9:.1f} GB)")
 
-print("downloading   TRELLIS.2-4B weights (~16 GB)")
-snapshot_download("microsoft/TRELLIS.2-4B", local_dir=f"{VOL}/trellis2-weights")
-
-# The worker image runs HF_HUB_OFFLINE=1 — after provisioning, a pod NEVER talks to HF. Stock
-# pipeline configs reference encoders by HUB NAME (facebook/dinov3-*: gated; briaai/RMBG-2.0:
-# restrictive license), which both violates that and can break under someone else's gating
-# decision. So: pull open-licensed equivalents into plain dirs on the volume (camenduru mirror =
-# same dinov3 weights, public; ZhengPeng7/BiRefNet = the permissive rembg the home box uses) and
-# rewrite the configs to those paths. Paths are the POD's mount point (/workspace) verbatim.
-print("downloading   encoders (dinov3 mirror + BiRefNet)")
-snapshot_download("camenduru/dinov3-vitl16-pretrain-lvd1689m",
-                  local_dir=f"{VOL}/encoders/dinov3-vitl16")
-snapshot_download("ZhengPeng7/BiRefNet", local_dir=f"{VOL}/encoders/BiRefNet")
-for cfg in ("pipeline.json", "texturing_pipeline.json"):
-    p = f"{VOL}/trellis2-weights/{cfg}"
-    s = open(p).read() \
-        .replace("facebook/dinov3-vitl16-pretrain-lvd1689m", "/workspace/encoders/dinov3-vitl16") \
-        .replace("briaai/RMBG-2.0", "/workspace/encoders/BiRefNet")
-    open(p, "w").write(s)
-    print(f"patched       {cfg}: hub names -> /workspace/encoders/*")
-
 # local_dir downloads leave a .cache/huggingface staging dir beside the weights. The volume holds
 # weights and nothing else, so drop them — a re-run re-downloads whole rather than resuming, which
 # is the trade this rule buys.
@@ -120,24 +107,12 @@ for root, dirs, _ in os.walk(VOL):
         shutil.rmtree(os.path.join(root, ".cache"))
         dirs.remove(".cache")
 
-# TRELLIS pulls these at pipeline load; pre-seed HF_HOME so the first mesh job doesn't stall.
-# transformers loads ONE weight format, and these repos ship four — an unfiltered snapshot took
-# 6.9 GB of volume for the 1.6 GB safetensors it reads.
-IGNORE = ["*.bin", "*.msgpack", "*.h5", "*.onnx", "*.onnx_data"]
-for repo in ("openai/clip-vit-large-patch14",
-             "camenduru/dinov3-vitl16-pretrain-lvd1689m"):
-    print(f"pre-seeding   {repo}")
-    try:
-        snapshot_download(repo, ignore_patterns=IGNORE)
-    except Exception as e:
-        print(f"  skipped ({e}) — will fetch at runtime")
 PY
 
 echo
 # du only — a RunPod network volume is MooseFS-backed, so df reports the whole cluster, never
 # this volume's usage or quota.
 echo "== volume contents =="
-du -sh "$VOL/comfy/models" "$VOL/trellis2-weights" \
-       "$VOL/hf-cache" "$VOL"
+du -sh "$VOL/comfy/models" "$VOL/hf-cache" "$VOL"
 echo "== anything that is not a weight (expect only the two BiRefNet .py) =="
 find "$VOL" \( -name .cache -o -name "*.py" -o -name "__pycache__" \) -maxdepth 6

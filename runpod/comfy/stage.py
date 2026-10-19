@@ -8,9 +8,12 @@ FOLDERS = {
     "image": {
         "checkpoints": ["DreamShaperXL_Turbo_v2_1.safetensors"],
         "diffusion_models": ["qwen_image_2512_fp8_e4m3fn.safetensors",
-                             "qwen_image_edit_2511_fp8mixed.safetensors"],
+                             "qwen_image_edit_2511_fp8mixed.safetensors",
+                             "trellis_2_bf16.safetensors"],
         "text_encoders": ["qwen_2.5_vl_7b_fp8_scaled.safetensors"],
-        "vae": ["qwen_image_vae.safetensors"],
+        "vae": ["qwen_image_vae.safetensors", "trellis_2_shape_vae_bf16.safetensors",
+                "trellis_2_texture_vae_bf16.safetensors"],
+        "clip_vision": ["dino_v3_vit_l.safetensors"],
     },
 }
 

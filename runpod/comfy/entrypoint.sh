@@ -51,7 +51,8 @@ PY
 python /opt/gamesummoner/stage.py "$VOL_MODELS" "$STAGE_DIR" "$TREE" "$QUEUE" &
 stage_pid=$!
 
-python /opt/ComfyUI/main.py --listen 127.0.0.1 --port "$COMFY_PORT" --disable-auto-launch &
+python /opt/ComfyUI/main.py --listen 127.0.0.1 --port "$COMFY_PORT" --disable-auto-launch \
+    --use-pytorch-cross-attention &
 comfy_pid=$!
 
 for _ in $(seq 1 90); do

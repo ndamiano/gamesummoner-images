@@ -114,9 +114,12 @@ class FakeComfy:
                     if pid not in comfy.outputs:
                         self._send(200, {})
                         return
-                    images = [{"filename": n, "subfolder": "", "type": "output"}
-                              for n, _ in comfy.outputs[pid]]
-                    self._send(200, {pid: {"outputs": {"9": {"images": images}},
+                    files = [{"filename": n, "subfolder": "", "type": "output"}
+                             for n, _ in comfy.outputs[pid]]
+                    images = [f for f in files if not f["filename"].endswith(".glb")]
+                    meshes = [f for f in files if f["filename"].endswith(".glb")]
+                    self._send(200, {pid: {"outputs": {"9": {"images": images},
+                                                       "10": {"3d": meshes}},
                                            "status": {"status_str": "success"}}})
                 elif self.path.startswith("/view?"):
                     q = urllib.parse.parse_qs(self.path.split("?", 1)[1])
