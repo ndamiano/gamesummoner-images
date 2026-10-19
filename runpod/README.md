@@ -9,8 +9,7 @@ terminate.
 | folder | queue | engine | card |
 |---|---|---|---|
 | `llm/` | llm | Pennyroyal SGLang, Qwen3.8 Flash-Next | RTX PRO 6000 |
-| `image/` | image | ComfyUI (Dockerfile in `comfy/`) | 5090 / RTX PRO 4500 |
-| `mesh/` | mesh | TRELLIS.2 | 5090 / RTX PRO 4500 |
+| `image/` | image | ComfyUI (Dockerfile in `comfy/`): images and TRELLIS.2 meshes | 5090 / RTX PRO 4500 |
 
 Every pod gets the same env from the scaler (`CP_URL`, `WORKER_TOKEN`, `WORKER_QUEUE`,
 `IDLE_EXIT_SECONDS`, plus the llm's `LLM_*`, `SGLANG_ARGS_EXTRA`, `WORKER_SLOTS`) and its
@@ -21,15 +20,14 @@ registry auth alone. Every build script stages the pinned worker and bakes a fre
 bump the tag on every push, because RunPod caches images per host.
 
 Two volumes, because a volume pins its datacenter: the **art volume** (EU-RO-1, 5090-class
-hosts; `runpod.network_volume_id` in the control plane) holds the image and mesh
+hosts; `runpod.network_volume_id` in the control plane) holds the ComfyUI
 weights, and the **llm volumes** (one per datacenter the RTX PRO 6000 is in;
 `queues.llm.network_volume_ids`) hold the checkpoint and the engine tarball. `provision_volume.sh`
 is the authority on the art volume: run it on any cheap pod with the volume mounted, no GPU
 touched, and it pulls every weight from Hugging Face at datacenter bandwidth, idempotently.
 The NSFW classifier at `comfy/models/safety/` (`model.pt` + `config.json`) is not in it: the
 control plane's `scripts/export_safety_model.py` produces it, and it is copied over the S3
-endpoint. After provisioning a pod never talks to Hugging Face (`HF_HUB_OFFLINE=1` on the mesh
-box; ComfyUI resolves weights by folder).
+endpoint. After provisioning a pod never talks to Hugging Face: ComfyUI resolves weights by folder.
 
 ## ComfyUI box (image)
 
@@ -38,7 +36,8 @@ the queue is baked (`QUEUE`), the cell it runs is `runpod/<queue>/server.py`, an
 entrypoint refuses a `WORKER_QUEUE` that disagrees. The base is `pytorch/pytorch:2.10.0-cuda13.0`,
 which matches the home box exactly, the only configuration the sprite workflow has ever run on;
 everything installs into that system python on purpose, because a venv would shadow the CUDA
-build. ComfyUI is pinned by full SHA to the commit the home box serves from (v0.30.1), and the RMBG node is pinned the same way; only its BiRefNet path is
+build. ComfyUI is pinned by full SHA to the commit the home box serves from (v0.39.2, which carries
+the native TRELLIS.2 and mesh post-processing nodes the mesh graph uses), and the RMBG node is pinned the same way; only its BiRefNet path is
 used, so its siblings' 2 GB of dependencies stay out, and `timm` is installed by hand because the
 node execs a `birefnet.py` it downloads at inference time that imports it.
 
@@ -70,7 +69,7 @@ What the volume holds for these queues (`comfy/models/`):
 
 | queue | weights | GB |
 |---|---|---|
-| image | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte) | 58 |
+| image | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte), `diffusion_models/trellis_2_bf16` with `vae/trellis_2_shape_vae_bf16` and `vae/trellis_2_texture_vae_bf16` and `clip_vision/dino_v3_vit_l` (TRELLIS.2 meshes) | 72 |
 
 An image checkpoint is named by a workflow the control plane sends, so a weight that leaves the
 control plane's workflows leaves the volume and `stage.py` with it. Roll the volume forward
@@ -79,42 +78,6 @@ pod predating a swap dies at boot on a weight that is not there.
 
 ```
 runpod/image/build.sh ndamiano100/gamesummoner-images:image-runpod-v1
-```
-
-## mesh
-
-TRELLIS.2-4B (image to mesh with native PBR textures) behind `engines/trellis/trellis_server.py`.
-
-The Dockerfile's builder stage compiles every CUDA extension TRELLIS's `setup.sh` installs
-(nvdiffrast, nvdiffrec, CuMesh, FlexGEMM, the in-tree o-voxel) against `TORCH_CUDA_ARCH_LIST=12.0`,
-Blackwell being the only card class this runs on, and ships them as wheels, so the runtime
-stage needs no compiler beyond the `gcc` triton wants for flex_gemm's kernels. TRELLIS is pinned
-by SHA and patched (`engines/trellis/trellis2-sdpa-dinov3.patch`: sdpa backends for sparse
-attention, which upstream only knows through xformers/flash-attn, and the transformers DINOv3
-module layout); transformers, timm, einops and kornia are pinned to the home-verified stack
-because transformers 5.14 renamed the DINOv3 internals TRELLIS reaches into.
-
-Boot (`mesh/entrypoint.sh`): guards (the volume), worker id, a one-GiB
-sequential read probe off the biggest checkpoint (if the pipeline loads at that rate the volume
-is the bottleneck; if much slower, the loader's mmap pattern is), env file,
-the TRELLIS server, then the contract server and the worker. The TRELLIS server stages its
-checkpoints to tmpfs, loads the pipeline and runs one throwaway mesh in the background, and
-reports `warm` on `/health`; the contract server's `/health` is 503 until then, because a job
-claimed earlier pays the whole cold start (53 s against 13 s, measured) as billed work.
-
-Jobs: `trellis_mesh` posts the PNG to `/generate` and retries once, because the 4B pipeline
-degrades across generates (70 s per mesh early, 160 s and CuMesh OOM by ~30) and a 500 is
-almost always that; the server's stage/load/generate split rides back on the result, since the
-pod's stdout is unreachable.
-
-Volume: `trellis2-weights/` with the encoders beside it (`encoders/dinov3-vitl16`,
-`encoders/BiRefNet`, open-licensed mirrors, and the pipeline configs rewritten to those paths so
-no hub name is ever resolved), the `hf-cache` pre-seed, and
-`flex-gemm-autotune.json`, flex_gemm's autotune picks, kept on the volume because on container
-disk every boot re-benchmarked every sparse-conv config (32.8 s of a 41.3 s warmup).
-
-```
-runpod/mesh/build.sh ndamiano100/gamesummoner-images:mesh-runpod-v1
 ```
 
 ## llm
