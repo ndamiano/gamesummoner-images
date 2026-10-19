@@ -10,11 +10,11 @@ when it boots.
 | `contract/server.py` | `Server`: the image side of the worker contract (`/health`, `/metadata`, `/job`, `/shutdown`), standard library only |
 | `contract/llm.py` | `LlmServer`: the llm queue against an OpenAI-compatible engine |
 | `contract/comfy.py` | `ComfyServer`: the comfy queue on ComfyUI, a workflow in, images or a TRELLIS.2 GLB out |
-| `contract/decide.py` | `DecideServer`: a chain of JEV System 1 decisions, the decision head applied over SGLang's hidden states |
+| `contract/decide.py` | `DecideServer`: a chain of JEV System 1 decisions, each read from option-token logprobs through the OpenAI completions API |
 | `contract/safety.py` | the NSFW verdict every rendered image carries |
-| `engines/` | inference servers we wrote ourselves: `jev/` (the JEV adapter split for SGLang); ComfyUI and SGLang are upstream |
+| `engines/` | `jev/head/`: JEV's per-option bias and per-kind temperature, which the decide contract applies; every engine is upstream |
 | `local/llm/` | the llm box for a local 5090: stock SGLang serving Qwen3.8 27B NVFP4 |
-| `local/decide/` | the decide box for a local 5090: stock SGLang serving JEV-27B-VL on Qwen3.8 27B NVFP4 |
+| `local/decide/` | the decide box for a local 5090: stock vLLM serving JEV-27B-VL's decision LoRA on Qwen3.8 27B NVFP4 |
 | `runpod/` | the RunPod boxes, one per queue: [runpod/README.md](runpod/README.md) |
 | `aws/` | the EC2 boxes, an AMI per queue: [aws/README.md](aws/README.md) |
 
@@ -101,21 +101,19 @@ cd ai-agent-test/src
 `run.sh` shares the host's Hugging Face cache, so only the first boot downloads the 18 GB
 checkpoint.
 
-Tests: `python -m pytest tests`. The contract tests need only the standard library; the
-decide tests need numpy and safetensors, and skip without them.
+Tests: `python -m pytest tests`. They need only the standard library and pytest.
 
 ## Local decide box
 
 Same shape as the llm box: `local/decide/build.sh`, then `local/decide/run.sh env.json` with
 `WORKER_QUEUE=decide`. Boot pulls `autotrust/JEV-27B-VL` and `unsloth/Qwen3.8-27B-NVFP4` at pinned
-revisions, and `engines/jev/prep.py` splits the adapter: SGLang loads the backbone LoRA, and
-`contract/decide.py` applies the lm_head part as the decision head over the returned hidden state,
-because SGLang cannot run a LoRA over that checkpoint's FP8 lm_head.
+revisions and serves the base with JEV's tokenizer and its `adapter_vllm` as the `jev-decision`
+LoRA. `contract/decide.py` asks each decision as one completion with `max_tokens: 1` and logprobs
+over the option tokens, then applies the bias and temperature in `engines/jev/head/`.
 
-The engine runs one request at a time (`--max-running-requests 1`, `WORKER_SLOTS=1`). Two
-sequences batched together with the LoRA and hidden states on moved JEV's probabilities by up to
-0.05 against the same question asked alone, so an answer depended on what else was in flight.
-Serial reads take about 68 ms each, warm.
+One prompt per request: JEV's LoRA path moved probabilities by up to 0.085 when several prompts
+shared a batch. A decision is one generated token, so the engine runs eager (no torch.compile, no
+CUDA graphs), text-only, with streamed weights: ready about 45 s after start on a 5090, from 146 s.
 
 ## RunPod boxes
 
