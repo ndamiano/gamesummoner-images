@@ -5,7 +5,7 @@ import base64
 import pytest
 
 from contract import safety
-from runpod.image.server import RunpodImageServer
+from runpod.comfy.server import RunpodComfyServer
 from support import FakeComfy, call, health_becomes, reason_becomes, serve, sleeper
 
 
@@ -15,7 +15,7 @@ def box(monkeypatch):
     comfy = FakeComfy()
     comfy.up = False
     engine_proc, entrypoint_proc = sleeper(), sleeper()
-    image, httpd, url = serve(RunpodImageServer, [
+    image, httpd, url = serve(RunpodComfyServer, [
         "--image-id", "img-1", "--engine-url", comfy.url, "--engine-pid", str(engine_proc.pid),
         "--entrypoint-pid", str(entrypoint_proc.pid)], monkeypatch)
     yield {"url": url, "comfy": comfy, "image": image}
@@ -35,7 +35,7 @@ def test_health_is_503_until_the_warmup_render_has_run(box):
 
 
 def test_metadata_names_the_queue_and_the_kind_separately(box):
-    assert call(box["url"], "GET", "/metadata")[1]["capabilities"] == ["image"]
+    assert call(box["url"], "GET", "/metadata")[1]["capabilities"] == ["comfy"]
     assert box["image"].kinds == ("comfy_image", "comfy_mesh")
 
 

@@ -5,7 +5,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 FOLDERS = {
-    "image": {
+    "comfy": {
         "checkpoints": ["DreamShaperXL_Turbo_v2_1.safetensors"],
         "diffusion_models": ["qwen_image_2512_fp8_e4m3fn.safetensors",
                              "qwen_image_edit_2511_fp8mixed.safetensors",

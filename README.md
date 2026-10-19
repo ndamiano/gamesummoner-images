@@ -9,7 +9,7 @@ when it boots.
 |---|---|
 | `contract/server.py` | `Server`: the image side of the worker contract (`/health`, `/metadata`, `/job`, `/shutdown`), standard library only |
 | `contract/llm.py` | `LlmServer`: the llm queue against an OpenAI-compatible engine |
-| `contract/comfy.py`, `image.py` | `ComfyServer` and the queue on ComfyUI: `ImageServer` (a workflow in, images or a TRELLIS.2 GLB out) |
+| `contract/comfy.py` | `ComfyServer`: the comfy queue on ComfyUI, a workflow in, images or a TRELLIS.2 GLB out |
 | `contract/decide.py` | `DecideServer`: a chain of JEV System 1 decisions, the decision head applied over SGLang's hidden states |
 | `contract/safety.py` | the NSFW verdict every rendered image carries |
 | `engines/` | inference servers we wrote ourselves: `jev/` (the JEV adapter split for SGLang); ComfyUI and SGLang are upstream |
@@ -25,15 +25,15 @@ The contract servers form a grid. `contract/server.py` is the corner; a queue's
 class extends the command line by overriding `add_arguments` and `__init__` and calling super
 first, and the MRO threads the chain, so the cell needs no code of its own.
 
-|  | `contract/llm.py` | `contract/image.py` | `contract/decide.py` |
+|  | `contract/llm.py` | `contract/comfy.py` | `contract/decide.py` |
 |---|---|---|---|
-| `local/server.py` | `local/llm/` | `local/image/` | `local/decide/` |
-| `runpod/server.py` | `runpod/llm/` | `runpod/image/` | |
+| `local/server.py` | `local/llm/` | `local/comfy/` | `local/decide/` |
+| `runpod/server.py` | `runpod/llm/` | `runpod/comfy/` | |
 | `aws/server.py` | `aws/llm/` | | `aws/decide/` |
 
 A column sets two tuples: `capabilities`, the queue names a worker may pull for this box, and
 `kinds`, the payload kinds `/job` runs, which is what the worker sends as `type`. They differ
-for every queue but llm (`image` runs `comfy_image` and `comfy_mesh`).
+for every queue but llm (`comfy` runs `comfy_image` and `comfy_mesh`).
 
 One folder per provider, one folder per queue inside it. An image folder holds its `server.py`,
 Dockerfile, entrypoint, build script and `worker.ref`. The Dockerfile copies `contract/`, the
@@ -119,7 +119,7 @@ Serial reads take about 68 ms each, warm.
 
 ## RunPod boxes
 
-`runpod/` holds the two RunPod images (llm, image) ported onto the contract.
+`runpod/` holds the two RunPod images (llm, comfy) ported onto the contract.
 Everything about them that needs a why (the llm engine tarball on the volume, the prepacked
 checkpoint, weight staging on the ComfyUI box, boot orders, build
 and ship, volume layouts) is in [runpod/README.md](runpod/README.md).

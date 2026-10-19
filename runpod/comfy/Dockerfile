@@ -1,4 +1,4 @@
-# RunPod ComfyUI box, built once per queue (--build-arg QUEUE=image). See runpod/README.md.
+# RunPod ComfyUI box (--build-arg QUEUE=comfy). See runpod/README.md.
 FROM pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends git curl \

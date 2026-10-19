@@ -9,7 +9,7 @@ terminate.
 | folder | queue | engine | card |
 |---|---|---|---|
 | `llm/` | llm | Pennyroyal SGLang, Qwen3.8 Flash-Next | RTX PRO 6000 |
-| `image/` | image | ComfyUI (Dockerfile in `comfy/`): images and TRELLIS.2 meshes | 5090 / RTX PRO 4500 |
+| `comfy/` | comfy | ComfyUI: images and TRELLIS.2 meshes | 5090 / RTX PRO 4500 |
 
 Every pod gets the same env from the scaler (`CP_URL`, `WORKER_TOKEN`, `WORKER_QUEUE`,
 `IDLE_EXIT_SECONDS`, plus the llm's `LLM_*`, `SGLANG_ARGS_EXTRA`, `WORKER_SLOTS`) and its
@@ -29,11 +29,11 @@ The NSFW classifier at `comfy/models/safety/` (`model.pt` + `config.json`) is no
 control plane's `scripts/export_safety_model.py` produces it, and it is copied over the S3
 endpoint. After provisioning a pod never talks to Hugging Face: ComfyUI resolves weights by folder.
 
-## ComfyUI box (image)
+## ComfyUI box (comfy)
 
-One Dockerfile, `comfy/Dockerfile`, built per queue with `--build-arg QUEUE=image`:
-the queue is baked (`QUEUE`), the cell it runs is `runpod/<queue>/server.py`, and the
-entrypoint refuses a `WORKER_QUEUE` that disagrees. The base is `pytorch/pytorch:2.10.0-cuda13.0`,
+`comfy/Dockerfile`, built with `--build-arg QUEUE=comfy`: the queue is baked (`QUEUE`), the
+cell it runs is `runpod/<queue>/server.py`, and the entrypoint refuses a `WORKER_QUEUE` that
+disagrees. The base is `pytorch/pytorch:2.10.0-cuda13.0`,
 which matches the home box exactly, the only configuration the sprite workflow has ever run on;
 everything installs into that system python on purpose, because a venv would shadow the CUDA
 build. ComfyUI is pinned by full SHA to the commit the home box serves from (v0.39.2, which carries
@@ -69,7 +69,7 @@ What the volume holds for these queues (`comfy/models/`):
 
 | queue | weights | GB |
 |---|---|---|
-| image | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte), `diffusion_models/trellis_2_bf16` with `vae/trellis_2_shape_vae_bf16` and `vae/trellis_2_texture_vae_bf16` and `clip_vision/dino_v3_vit_l` (TRELLIS.2 meshes) | 72 |
+| comfy | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte), `diffusion_models/trellis_2_bf16` with `vae/trellis_2_shape_vae_bf16` and `vae/trellis_2_texture_vae_bf16` and `clip_vision/dino_v3_vit_l` (TRELLIS.2 meshes) | 72 |
 
 An image checkpoint is named by a workflow the control plane sends, so a weight that leaves the
 control plane's workflows leaves the volume and `stage.py` with it. Roll the volume forward
@@ -77,7 +77,7 @@ first, the template second, and retire the old weight last: the warmup names the
 pod predating a swap dies at boot on a weight that is not there.
 
 ```
-runpod/image/build.sh ndamiano100/gamesummoner-images:image-runpod-v1
+runpod/comfy/build.sh ndamiano100/gamesummoner-images:comfy-runpod-v1
 ```
 
 ## llm
