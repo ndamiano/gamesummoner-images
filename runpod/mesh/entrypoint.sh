@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# RunPod mesh box: start the TRELLIS and sprite servers, the contract server and the worker.
+# RunPod mesh box: start the TRELLIS server, the contract server and the worker.
 # Boot order and reasons: runpod/README.md.
 set -euo pipefail
 
@@ -25,8 +25,6 @@ mark() { echo "[boot +$(( $(date +%s) - boot_t0 ))s] $*"; }
 
 test -d "$TRELLIS_WEIGHTS" || {
     echo "network volume not mounted: $TRELLIS_WEIGHTS is missing" >&2; exit 1; }
-test -f "$SAFETY_MODEL_DIR/model.pt" || {
-    echo "NSFW classifier missing: $SAFETY_MODEL_DIR/model.pt" >&2; exit 1; }
 
 probe=$(ls -S "$TRELLIS_WEIGHTS"/ckpts/*.safetensors 2>/dev/null | head -1)
 if [ -n "$probe" ]; then
@@ -43,11 +41,6 @@ env.setdefault("WORKER_QUEUE", "mesh")
 json.dump(env, open(sys.argv[1], "w"))
 PY
 
-"$SPRITE_PYTHON" /opt/gamesummoner/engines/sprites/sprite_server.py \
-    --host 127.0.0.1 --port "$SPRITE_PORT" \
-    ${KIMODO_TPOSE_BVH:+--ref-bvh "$KIMODO_TPOSE_BVH"} &
-sprite_pid=$!
-
 python /opt/gamesummoner/engines/trellis/trellis_server.py \
     --repo "$TRELLIS_REPO" --weights "$TRELLIS_WEIGHTS" \
     --host 127.0.0.1 --port "$TRELLIS_PORT" &
@@ -55,7 +48,6 @@ trellis_pid=$!
 
 PYTHONPATH=/opt/gamesummoner python -m runpod.mesh.server \
     --engine-url "http://127.0.0.1:$TRELLIS_PORT" --engine-pid "$trellis_pid" \
-    --sprite-url "http://127.0.0.1:$SPRITE_PORT" \
     --image-id "$(cat /opt/gamesummoner/image-id)" --cli-params="trellis_server.py --ptype 512 --texture 1024" \
     --entrypoint-pid $$ --port "$IMAGE_PORT" &
 contract_pid=$!
@@ -74,14 +66,14 @@ decommission() {
         kill -0 "$worker_pid" 2>/dev/null || break
         sleep 1
     done
-    kill -TERM "$worker_pid" "$trellis_pid" "$sprite_pid" "$contract_pid" 2>/dev/null || true
+    kill -TERM "$worker_pid" "$trellis_pid" "$contract_pid" 2>/dev/null || true
     mark "box down"
     exit 0
 }
 trap decommission TERM INT
 
 set +e
-wait -n "$trellis_pid" "$sprite_pid" "$contract_pid" "$worker_pid"
+wait -n "$trellis_pid" "$contract_pid" "$worker_pid"
 mark "a box process exited on its own"
-kill -TERM "$worker_pid" "$trellis_pid" "$sprite_pid" "$contract_pid" 2>/dev/null || true
+kill -TERM "$worker_pid" "$trellis_pid" "$contract_pid" 2>/dev/null || true
 exit 1

@@ -12,11 +12,6 @@ FOLDERS = {
         "text_encoders": ["qwen_2.5_vl_7b_fp8_scaled.safetensors"],
         "vae": ["qwen_image_vae.safetensors"],
     },
-    "video": {
-        "diffusion_models": ["minimax_h3_fl2va_pruned_int8_convrot.safetensors"],
-        "text_encoders": ["qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"],
-        "vae": ["minimax_h3_video_vae_fp16.safetensors"],
-    },
 }
 
 

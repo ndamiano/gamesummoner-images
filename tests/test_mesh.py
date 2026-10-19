@@ -1,5 +1,4 @@
-"""The mesh column: TRELLIS gates /health on `warm`, a sprite in is a glb out, and a sheet is
-rendered beside it and scored cell by cell."""
+"""The mesh column: TRELLIS gates /health on `warm`, and a sprite in is a glb out."""
 
 import base64
 import json
@@ -8,18 +7,16 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from contract import mesh, safety
 from runpod.mesh.server import RunpodMeshServer
 from support import call, health_becomes, reason_becomes, serve, sleeper
 
 
 class FakeEngine:
-    """One fake for both: TRELLIS (/health, /generate) and the sprite server (/health, /sheet)."""
+    """A fake TRELLIS server: /health and /generate."""
 
     def __init__(self):
         self.health = {"status": "ok", "loaded": False, "warm": False}
         self.generate = [(200, b"GLB")]
-        self.sheet = (200, {"sheet_b64": "x", "manifest": {}})
         self.calls = []
         engine = self
 
@@ -45,8 +42,6 @@ class FakeEngine:
                     status, body = engine.generate.pop(0)
                     self._send(status, body, headers=[("X-Generate-Seconds", "7.5"),
                                                       ("X-Load-Seconds", "30")])
-                elif self.path == "/sheet":
-                    self._send(*engine.sheet)
                 else:
                     self._send(404, {})
 
@@ -60,19 +55,17 @@ class FakeEngine:
 
 @pytest.fixture
 def box(monkeypatch):
-    trellis, sprite = FakeEngine(), FakeEngine()
-    sprite.health = {"status": "ok", "loaded": True, "verbs": ["walk"]}
+    trellis = FakeEngine()
     engine_proc, entrypoint_proc = sleeper(), sleeper()
     image, httpd, url = serve(RunpodMeshServer, [
-        "--image-id", "img-1", "--engine-url", trellis.url, "--sprite-url", sprite.url,
+        "--image-id", "img-1", "--engine-url", trellis.url,
         "--engine-pid", str(engine_proc.pid), "--entrypoint-pid", str(entrypoint_proc.pid)],
         monkeypatch)
-    yield {"url": url, "trellis": trellis, "sprite": sprite}
+    yield {"url": url, "trellis": trellis}
     engine_proc.kill()
     entrypoint_proc.kill()
     httpd.shutdown()
     trellis.httpd.shutdown()
-    sprite.httpd.shutdown()
 
 
 def test_health_waits_for_trellis_to_be_warm_not_merely_up(box):
@@ -106,73 +99,3 @@ def test_a_failed_generate_is_retried_once_then_reported(box):
         "jobId": "j2", "type": "trellis_mesh",
         "payload": {"image_b64": base64.b64encode(b"PNG").decode()}})
     assert status == 502 and "TRELLIS failed: Status 500: b" in body["error"]
-
-
-def _sheet_png(cells_wide=2, cells_high=2, cell=8):
-    Image = pytest.importorskip("PIL.Image")
-    import io
-    buf = io.BytesIO()
-    Image.new("RGB", (cells_wide * cell, cells_high * cell), "white").save(buf, "PNG")
-    return base64.b64encode(buf.getvalue()).decode("ascii")
-
-
-def test_a_rendered_sheet_is_scored_cell_by_cell_and_the_worst_cell_speaks(box, monkeypatch):
-    box["sprite"].sheet = (200, {"sheet_b64": _sheet_png(2, 2, 8),
-                                 "manifest": {"cell": {"w": 8, "h": 8}}})
-    seen = []
-
-    def classify(png):
-        seen.append(png)
-        return {"scores": {"NSFW": 0.9 if len(seen) == 3 else 0.1}}
-
-    monkeypatch.setattr(safety, "classify", classify)
-    status, body = call(box["url"], "POST", "/job", {
-        "jobId": "j1", "type": "sprite_sheet", "payload": {"glb_b64": "g", "anims": []}})
-    assert status == 200 and len(seen) == 4
-    assert body["result"]["safety"] == {"scores": {"NSFW": 0.9}}
-    assert box["sprite"].calls[0][0] == "/sheet"
-
-
-def test_a_sheet_that_is_not_an_image_carries_a_verdict_that_refuses_it(box, monkeypatch):
-    pytest.importorskip("PIL")
-    monkeypatch.setattr(safety, "classify", lambda b: {"scores": {"NSFW": 0.0}})
-    status, body = call(box["url"], "POST", "/job", {
-        "jobId": "j1", "type": "sprite_sheet", "payload": {"glb_b64": "g", "anims": []}})
-    assert status == 200
-    assert "scores" not in body["result"]["safety"] and body["result"]["safety"]["error"]
-
-
-def test_a_fallback_sheet_is_not_scored(box, monkeypatch):
-    box["sprite"].sheet = (200, {"fallback": "not a humanoid"})
-    monkeypatch.setattr(safety, "classify",
-                        lambda b: (_ for _ in ()).throw(AssertionError("scored a fallback")))
-    status, body = call(box["url"], "POST", "/job", {
-        "jobId": "j1", "type": "sprite_sheet", "payload": {"glb_b64": "g", "anims": []}})
-    assert status == 200 and "safety" not in body["result"]
-    assert body["result"]["fallback"] == "not a humanoid"
-
-
-def test_a_dead_sheet_server_is_a_502(box):
-    box["sprite"].httpd.shutdown()
-    box["sprite"].httpd.server_close()
-    status, body = call(box["url"], "POST", "/job", {
-        "jobId": "j1", "type": "sprite_sheet", "payload": {"glb_b64": "g", "anims": []}})
-    assert status == 502 and "unreachable" in body["error"]
-
-
-def test_a_box_without_a_sprite_server_refuses_sheet_jobs(monkeypatch):
-    trellis = FakeEngine()
-    engine_proc, entrypoint_proc = sleeper(), sleeper()
-    image, httpd, url = serve(RunpodMeshServer, [
-        "--image-id", "img-1", "--engine-url", trellis.url,
-        "--engine-pid", str(engine_proc.pid), "--entrypoint-pid", str(entrypoint_proc.pid)],
-        monkeypatch)
-    try:
-        status, body = call(url, "POST", "/job", {
-            "jobId": "j1", "type": "sprite_sheet", "payload": {"glb_b64": "g", "anims": []}})
-        assert status == 500 and "no sprite server" in body["error"]
-    finally:
-        engine_proc.kill()
-        entrypoint_proc.kill()
-        httpd.shutdown()
-        trellis.httpd.shutdown()

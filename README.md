@@ -9,11 +9,11 @@ when it boots.
 |---|---|
 | `contract/server.py` | `Server`: the image side of the worker contract (`/health`, `/metadata`, `/job`, `/shutdown`), standard library only |
 | `contract/llm.py` | `LlmServer`: the llm queue against an OpenAI-compatible engine |
-| `contract/comfy.py`, `image.py`, `video.py` | `ComfyServer` and the two queues on ComfyUI: `ImageServer` (a workflow in, images out), `VideoServer` (a still in, a sprite sheet out via `anim_sheet.py`) |
-| `contract/mesh.py` | `MeshServer`: TRELLIS meshes and rendered sprite sheets |
+| `contract/comfy.py`, `image.py` | `ComfyServer` and the queue on ComfyUI: `ImageServer` (a workflow in, images out) |
+| `contract/mesh.py` | `MeshServer`: TRELLIS meshes |
 | `contract/decide.py` | `DecideServer`: a chain of JEV System 1 decisions, the decision head applied over SGLang's hidden states |
 | `contract/safety.py` | the NSFW verdict every rendered image carries |
-| `engines/` | inference servers we wrote ourselves: `trellis/` (TRELLIS.2), `sprites/` (kimodo sheets), `jev/` (the JEV adapter split for SGLang); ComfyUI and SGLang are upstream |
+| `engines/` | inference servers we wrote ourselves: `trellis/` (TRELLIS.2), `jev/` (the JEV adapter split for SGLang); ComfyUI and SGLang are upstream |
 | `local/llm/` | the llm box for a local 5090: stock SGLang serving Qwen3.8 27B NVFP4 |
 | `local/decide/` | the decide box for a local 5090: stock SGLang serving JEV-27B-VL on Qwen3.8 27B NVFP4 |
 | `runpod/` | the RunPod boxes, one per queue: [runpod/README.md](runpod/README.md) |
@@ -26,16 +26,15 @@ The contract servers form a grid. `contract/server.py` is the corner; a queue's
 class extends the command line by overriding `add_arguments` and `__init__` and calling super
 first, and the MRO threads the chain, so the cell needs no code of its own.
 
-|  | `contract/llm.py` | `contract/image.py` | `contract/video.py` | `contract/mesh.py` | `contract/decide.py` |
-|---|---|---|---|---|---|
-| `local/server.py` | `local/llm/` | | | | `local/decide/` |
-| `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/video/` | `runpod/mesh/` | |
-| `aws/server.py` | `aws/llm/` | | | | `aws/decide/` |
+|  | `contract/llm.py` | `contract/image.py` | `contract/mesh.py` | `contract/decide.py` |
+|---|---|---|---|---|
+| `local/server.py` | `local/llm/` | | | `local/decide/` |
+| `runpod/server.py` | `runpod/llm/` | `runpod/image/` | `runpod/mesh/` | |
+| `aws/server.py` | `aws/llm/` | | | `aws/decide/` |
 
 A column sets two tuples: `capabilities`, the queue names a worker may pull for this box, and
 `kinds`, the payload kinds `/job` runs, which is what the worker sends as `type`. They differ
-for every queue but llm (`image` runs `comfy_image`; `mesh` runs `trellis_mesh` and
-`sprite_sheet`).
+for every queue but llm (`image` runs `comfy_image`; `mesh` runs `trellis_mesh`).
 
 One folder per provider, one folder per queue inside it. An image folder holds its `server.py`,
 Dockerfile, entrypoint, build script and `worker.ref`. The Dockerfile copies `contract/`, the
@@ -104,8 +103,7 @@ cd ai-agent-test/src
 checkpoint.
 
 Tests: `python -m pytest tests`. The contract tests need only the standard library; the
-anim-sheet, sprites3d and video tests also need numpy and Pillow, the decide tests numpy and
-safetensors, and they skip without them.
+decide tests need numpy and safetensors, and skip without them.
 
 ## Local decide box
 
@@ -122,7 +120,7 @@ Serial reads take about 68 ms each, warm.
 
 ## RunPod boxes
 
-`runpod/` holds the four RunPod images (llm, image, video, mesh) ported onto the contract.
+`runpod/` holds the three RunPod images (llm, image, mesh) ported onto the contract.
 Everything about them that needs a why (the llm engine tarball on the volume, the prepacked
-checkpoint, weight staging on the ComfyUI boxes, the mesh box's two servers, boot orders, build
+checkpoint, weight staging on the ComfyUI boxes, the mesh box, boot orders, build
 and ship, volume layouts) is in [runpod/README.md](runpod/README.md).

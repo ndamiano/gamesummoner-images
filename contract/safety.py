@@ -1,6 +1,6 @@
 """Post-render NSFW verdict for every rendered image.
 
-An image only ever REPORTS scores — every image, video and sheet result carries them, and the
+An image only ever REPORTS scores — every image result carries them, and the
 control plane's policy decides what a score means. Keeping policy out of here is what lets a
 future surface with different rules reuse the same verdicts.
 

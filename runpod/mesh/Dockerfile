@@ -1,4 +1,4 @@
-# RunPod mesh box: TRELLIS.2 plus the kimodo sprite-sheet server, one container. See runpod/README.md.
+# RunPod mesh box: TRELLIS.2. See runpod/README.md.
 FROM pytorch/pytorch:2.9.1-cuda12.8-cudnn9-devel AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
@@ -47,17 +47,6 @@ RUN pip install --no-cache-dir --no-deps /wheels/*.whl \
         plyfile scipy moderngl \
     && rm -rf /wheels
 
-ARG KIMODO_SHA=1aece8c124d73d255ceff5086d983b844c9f4e94
-RUN apt-get update && apt-get install -y --no-install-recommends git build-essential \
-    && python -m venv --system-site-packages /opt/kimodo-venv \
-    && /opt/kimodo-venv/bin/pip install --no-cache-dir "setuptools>=61" \
-    && /opt/kimodo-venv/bin/pip install --no-cache-dir --no-build-isolation \
-        "kimodo @ git+https://github.com/nv-tlabs/kimodo@${KIMODO_SHA}" \
-    && /opt/kimodo-venv/bin/pip install --no-cache-dir playwright pygltflib pillow \
-    && /opt/kimodo-venv/bin/playwright install --with-deps chromium \
-    && apt-get purge -y git build-essential && apt-get autoremove -y \
-    && rm -rf /var/lib/apt/lists/*
-
 ARG IMAGE_ID
 COPY contract /opt/gamesummoner/contract
 COPY engines /opt/gamesummoner/engines
@@ -76,16 +65,9 @@ ENV PYTHONUNBUFFERED=1 \
     HF_HUB_OFFLINE=1 \
     TRANSFORMERS_OFFLINE=1 \
     TRITON_CACHE_DIR=/workspace/triton-cache \
-    FLEX_GEMM_AUTOTUNE_CACHE_PATH=/workspace/flex-gemm-autotune.json \
-    SPRITE_PYTHON=/opt/kimodo-venv/bin/python \
-    SPRITE_PORT=8190 \
-    CHECKPOINT_DIR=/workspace/kimodo \
-    SAFETY_MODEL_DIR=/workspace/comfy/models/safety
+    FLEX_GEMM_AUTOTUNE_CACHE_PATH=/workspace/flex-gemm-autotune.json
 
-# Build-time smoke: each interpreter imports what its server needs.
-RUN python -c "import torch, triton" \
-    && /opt/kimodo-venv/bin/python -c "import torch, kimodo, pygltflib, playwright" \
-    && cd /opt/gamesummoner/engines/sprites && /opt/kimodo-venv/bin/python -c \
-        "from sprites3d import rig, retarget, sheet, verbs; verbs.Table()"
+# Build-time smoke: the interpreter imports what the server needs.
+RUN python -c "import torch, triton"
 
 ENTRYPOINT ["/opt/gamesummoner/entrypoint.sh"]

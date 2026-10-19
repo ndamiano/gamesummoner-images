@@ -9,8 +9,8 @@ terminate.
 | folder | queue | engine | card |
 |---|---|---|---|
 | `llm/` | llm | Pennyroyal SGLang, Qwen3.8 Flash-Next | RTX PRO 6000 |
-| `image/`, `video/` | image, video | ComfyUI (one Dockerfile in `comfy/`, built per queue) | 5090 / RTX PRO 4500 |
-| `mesh/` | mesh | TRELLIS.2 plus the kimodo sprite-sheet server | 5090 / RTX PRO 4500 |
+| `image/` | image | ComfyUI (Dockerfile in `comfy/`) | 5090 / RTX PRO 4500 |
+| `mesh/` | mesh | TRELLIS.2 | 5090 / RTX PRO 4500 |
 
 Every pod gets the same env from the scaler (`CP_URL`, `WORKER_TOKEN`, `WORKER_QUEUE`,
 `IDLE_EXIT_SECONDS`, plus the llm's `LLM_*`, `SGLANG_ARGS_EXTRA`, `WORKER_SLOTS`) and its
@@ -21,7 +21,7 @@ registry auth alone. Every build script stages the pinned worker and bakes a fre
 bump the tag on every push, because RunPod caches images per host.
 
 Two volumes, because a volume pins its datacenter: the **art volume** (EU-RO-1, 5090-class
-hosts; `runpod.network_volume_id` in the control plane) holds the image, video and mesh
+hosts; `runpod.network_volume_id` in the control plane) holds the image and mesh
 weights, and the **llm volumes** (one per datacenter the RTX PRO 6000 is in;
 `queues.llm.network_volume_ids`) hold the checkpoint and the engine tarball. `provision_volume.sh`
 is the authority on the art volume: run it on any cheap pod with the volume mounted, no GPU
@@ -31,15 +31,14 @@ control plane's `scripts/export_safety_model.py` produces it, and it is copied o
 endpoint. After provisioning a pod never talks to Hugging Face (`HF_HUB_OFFLINE=1` on the mesh
 box; ComfyUI resolves weights by folder).
 
-## ComfyUI boxes (image, video)
+## ComfyUI box (image)
 
-One Dockerfile, `comfy/Dockerfile`, built once per queue with `--build-arg QUEUE=image|video`:
+One Dockerfile, `comfy/Dockerfile`, built per queue with `--build-arg QUEUE=image`:
 the queue is baked (`QUEUE`), the cell it runs is `runpod/<queue>/server.py`, and the
 entrypoint refuses a `WORKER_QUEUE` that disagrees. The base is `pytorch/pytorch:2.10.0-cuda13.0`,
 which matches the home box exactly, the only configuration the sprite workflow has ever run on;
 everything installs into that system python on purpose, because a venv would shadow the CUDA
-build. ComfyUI is pinned by full SHA to the commit the home box serves from (v0.30.1, where the
-MiniMax-H3 nodes are core), and the RMBG node is pinned the same way; only its BiRefNet path is
+build. ComfyUI is pinned by full SHA to the commit the home box serves from (v0.30.1), and the RMBG node is pinned the same way; only its BiRefNet path is
 used, so its siblings' 2 GB of dependencies stay out, and `timm` is installed by hand because the
 node execs a `birefnet.py` it downloads at inference time that imports it.
 
@@ -52,7 +51,7 @@ billed to a user's game for 2 s of sampling (measured 2026-08-02). `stage.py` co
 weights once, chunked and parallel (a single-stream `cp` of a 17 GB file reads well below what
 the volume serves to concurrent readers), in the background while ComfyUI imports torch, and
 swaps the symlinks only after every file landed whole. Not tmpfs: `/dev/shm` on a RunPod host
-is a fixed ~46 GB, under both queues' weights. A stage that does not fit is skipped with
+is a fixed ~46 GB, under the queue's weights. A stage that does not fit is skipped with
 `[stage] skipped` in the log and a silent 3.5-minute load off the mount, so the templates carry
 a 100 GB container disk. The RMBG node ignores `extra_model_paths.yaml` and resolves
 `models_dir/RMBG/BiRefNet`, which is why the tree has to be a real path.
@@ -62,7 +61,7 @@ background, ComfyUI, wait for `/system_stats` (it imports torch and every custom
 binds), wait for staging, then the contract server and the worker. The contract server's
 `/health` is 503 until its **warmup render** has run: the graph the queue's jobs run, one step
 at the smallest size the model takes (a 256 px sprite through the Qwen unet and the BiRefNet
-matte for image; a 5-frame clip from a white still for video), so the weight load, the matte's
+matte), so the weight load, the matte's
 lazy import and the first-use CUDA kernels are paid before the worker can claim. A warmup that
 fails is a 500, which the worker reads as "kill the box": a pod that cannot render dies at boot
 instead of failing a user's job.
@@ -71,8 +70,7 @@ What the volume holds for these queues (`comfy/models/`):
 
 | queue | weights | GB |
 |---|---|---|
-| image | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, anim stills, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte) | 58 |
-| video | `diffusion_models/minimax_h3_fl2va_pruned_int8_convrot` (image-to-video), `text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq`, `vae/minimax_h3_video_vae_fp16` | 42 |
+| image | `checkpoints/DreamShaperXL_Turbo_v2_1` (tiles, scene-chain terrain), `diffusion_models/qwen_image_2512_fp8_e4m3fn` (sprites, scenes, mesh subjects), `diffusion_models/qwen_image_edit_2511_fp8mixed` (the scene embed), the `text_encoders/qwen_2.5_vl_7b_fp8_scaled` and `vae/qwen_image_vae` both Qwen graphs share, `RMBG/BiRefNet` (the matte) | 58 |
 
 An image checkpoint is named by a workflow the control plane sends, so a weight that leaves the
 control plane's workflows leaves the volume and `stage.py` with it. Roll the volume forward
@@ -81,16 +79,11 @@ pod predating a swap dies at boot on a weight that is not there.
 
 ```
 runpod/image/build.sh ndamiano100/gamesummoner-images:image-runpod-v1
-runpod/video/build.sh ndamiano100/gamesummoner-images:video-runpod-v1
 ```
 
 ## mesh
 
-TRELLIS.2-4B (image to mesh with native PBR textures) behind `engines/trellis/trellis_server.py`
-and the kimodo sprite-sheet server behind `engines/sprites/sprite_server.py`, one container:
-a sheet is always rendered from a mesh this box just made, so the glb never leaves it and no
-second pod boots. They never run at once, and measured together on one card they peak at
-5.7 GiB.
+TRELLIS.2-4B (image to mesh with native PBR textures) behind `engines/trellis/trellis_server.py`.
 
 The Dockerfile's builder stage compiles every CUDA extension TRELLIS's `setup.sh` installs
 (nvdiffrast, nvdiffrec, CuMesh, FlexGEMM, the in-tree o-voxel) against `TORCH_CUDA_ARCH_LIST=12.0`,
@@ -99,31 +92,24 @@ stage needs no compiler beyond the `gcc` triton wants for flex_gemm's kernels. T
 by SHA and patched (`engines/trellis/trellis2-sdpa-dinov3.patch`: sdpa backends for sparse
 attention, which upstream only knows through xformers/flash-attn, and the transformers DINOv3
 module layout); transformers, timm, einops and kornia are pinned to the home-verified stack
-because transformers 5.14 renamed the DINOv3 internals TRELLIS reaches into. Kimodo lives in
-its own venv with `--system-site-packages`: it pins transformers 5.1 where TRELLIS needs 5.13,
-and sharing one torch saves a second two-gigabyte copy. Its `--no-build-isolation` is
-load-bearing (pip's build overlay shadows cmake with one that fails `--version`).
+because transformers 5.14 renamed the DINOv3 internals TRELLIS reaches into.
 
-Boot (`mesh/entrypoint.sh`): guards (the volume, the NSFW classifier), worker id, a one-GiB
+Boot (`mesh/entrypoint.sh`): guards (the volume), worker id, a one-GiB
 sequential read probe off the biggest checkpoint (if the pipeline loads at that rate the volume
-is the bottleneck; if much slower, the loader's mmap pattern is), env file, the sprite server,
+is the bottleneck; if much slower, the loader's mmap pattern is), env file,
 the TRELLIS server, then the contract server and the worker. The TRELLIS server stages its
 checkpoints to tmpfs, loads the pipeline and runs one throwaway mesh in the background, and
 reports `warm` on `/health`; the contract server's `/health` is 503 until then, because a job
-claimed earlier pays the whole cold start (53 s against 13 s, measured) as billed work. The
-sprite server loads kimodo at start and reports `loaded`.
+claimed earlier pays the whole cold start (53 s against 13 s, measured) as billed work.
 
 Jobs: `trellis_mesh` posts the PNG to `/generate` and retries once, because the 4B pipeline
 degrades across generates (70 s per mesh early, 160 s and CuMesh OOM by ~30) and a 500 is
 almost always that; the server's stage/load/generate split rides back on the result, since the
-pod's stdout is unreachable. `sprite_sheet` posts to `/sheet` and scores every cell of the sheet
-with the classifier, the worst cell speaking for the whole; a `fallback` (no skeleton fits the
-silhouette) is passed through unscored so the control plane draws that one instead.
+pod's stdout is unreachable.
 
 Volume: `trellis2-weights/` with the encoders beside it (`encoders/dinov3-vitl16`,
 `encoders/BiRefNet`, open-licensed mirrors, and the pipeline configs rewritten to those paths so
-no hub name is ever resolved), the `hf-cache` pre-seed, `kimodo/Kimodo-SOMA-RP-v1.1` (the folder
-is named for the model's display name because `CHECKPOINT_DIR` looks it up that way), and
+no hub name is ever resolved), the `hf-cache` pre-seed, and
 `flex-gemm-autotune.json`, flex_gemm's autotune picks, kept on the volume because on container
 disk every boot re-benchmarked every sparse-conv config (32.8 s of a 41.3 s warmup).
 

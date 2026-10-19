@@ -54,8 +54,8 @@ VOL = sys.argv[1]
 #
 # The LLM is not here: it lives prepacked on the llm volume in another datacenter (README).
 FILES = [
-    # The image queue's checkpoints, by kind (see maestro/codegen: sprites, scenes, anim stills
-    # and mesh subjects -> Qwen-Image-2512; tiles + scene-chain terrain -> DreamShaperXL Turbo;
+    # The image queue's checkpoints, by kind (see maestro/codegen: sprites, scenes and mesh
+    # subjects -> Qwen-Image-2512; tiles + scene-chain terrain -> DreamShaperXL Turbo;
     # the scene embed -> Qwen-Image-Edit-2511). The two Qwen graphs share the VL text encoder
     # and the VAE.
     (f"{VOL}/comfy/models/checkpoints", "Lykon/dreamshaper-xl-v2-turbo",
@@ -68,14 +68,6 @@ FILES = [
      "split_files/text_encoders/qwen_2.5_vl_7b_fp8_scaled.safetensors", 9384670680, None),
     (f"{VOL}/comfy/models/vae", "Comfy-Org/Qwen-Image_ComfyUI",
      "split_files/vae/qwen_image_vae.safetensors", 253806246, None),
-    # The video queue: MiniMax-H3 image-to-video (pruned int8), its Qwen3-VL text encoder and
-    # video VAE. Same ComfyUI image as the image queue, staged only on a video pod.
-    (f"{VOL}/comfy/models/diffusion_models", "Comfy-Org/MiniMax-H3",
-     "diffusion_models/minimax_h3_fl2va_pruned_int8_convrot.safetensors", 20970379616, None),
-    (f"{VOL}/comfy/models/text_encoders", "Comfy-Org/MiniMax-H3",
-     "text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors", 15687142551, None),
-    (f"{VOL}/comfy/models/vae", "Comfy-Org/MiniMax-H3",
-     "vae/minimax_h3_video_vae_fp16.safetensors", 5207808496, None),
     (f"{VOL}/comfy/models/RMBG/BiRefNet", "1038lab/BiRefNet",
      "BiRefNet-general.safetensors", 0, None),
     (f"{VOL}/comfy/models/RMBG/BiRefNet", "1038lab/BiRefNet", "birefnet.py", 0, None),
@@ -108,16 +100,6 @@ snapshot_download("microsoft/TRELLIS.2-4B", local_dir=f"{VOL}/trellis2-weights")
 # decision. So: pull open-licensed equivalents into plain dirs on the volume (camenduru mirror =
 # same dinov3 weights, public; ZhengPeng7/BiRefNet = the permissive rembg the home box uses) and
 # rewrite the configs to those paths. Paths are the POD's mount point (/workspace) verbatim.
-# The motion model a sprite sheet is animated from. Its skeleton's standard T-pose clip ships
-# inside the package, and the retarget needs one: without it the delta carries the raw offset
-# skeleton and double-rotates an already-T-posed rig. No text encoder is pulled — the verb
-# library's embeddings are baked into the image (maestro/sprites3d/verb_embeddings.npz), so no
-# language model runs on a pod.
-# The folder is named for the model's DISPLAY name because that is what CHECKPOINT_DIR looks up;
-# a differently named folder sends the loader to Hugging Face, which a pod must never reach.
-print("downloading   kimodo motion weights (~1.1 GB)")
-snapshot_download("nvidia/Kimodo-SOMA-RP-v1.1", local_dir=f"{VOL}/kimodo/Kimodo-SOMA-RP-v1.1")
-
 print("downloading   encoders (dinov3 mirror + BiRefNet)")
 snapshot_download("camenduru/dinov3-vitl16-pretrain-lvd1689m",
                   local_dir=f"{VOL}/encoders/dinov3-vitl16")
