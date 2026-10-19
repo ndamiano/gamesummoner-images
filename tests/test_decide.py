@@ -1,21 +1,18 @@
 """The decide column: the step chain over a scripted reader, and the server over real sockets
-against a fake SGLang that returns hidden states, read through a synthetic decision head."""
+against a fake OpenAI engine that returns option-token logprobs, read through a synthetic head."""
 
 import json
+import math
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-np = pytest.importorskip("numpy")
-pytest.importorskip("safetensors")
-from safetensors.numpy import load_file, save_file  # noqa: E402
-
-from contract import server  # noqa: E402
-from contract.decide import choose, run_chain  # noqa: E402
-from local.decide.server import LocalDecideServer  # noqa: E402
-from runpod.decide.server import RunpodDecideServer  # noqa: E402
-from support import call, health_becomes, sleeper  # noqa: E402
+from contract import server
+from contract.decide import choose, run_chain
+from local.decide.server import LocalDecideServer
+from runpod.decide.server import RunpodDecideServer
+from support import call, health_becomes, sleeper
 
 
 class Reader:
@@ -95,31 +92,30 @@ def test_choice_over_forty_options_runs_a_tournament_that_keeps_the_favourite_an
     assert asked == [14, 13, 13, 16]
 
 
-HIDDEN = 4
+BIAS = [0.0, 0.5] + [0.0] * 6 + [0.25, -0.25] + [0.0] * 14
 
 
 @pytest.fixture
-def jev_dir(tmp_path):
-    ids = list(range(100, 124))
+def head_dir(tmp_path):
     (tmp_path / "decision_head.json").write_text(json.dumps({
-        "verbalizer_ids": ids, "bias": [0.0] * 24,
+        "verbalizer_ids": list(range(100, 124)), "bias": BIAS,
         "slots": {"ranges": {"noul": [0, 2], "score": [2, 8], "choice": [8, 24]}}}))
     (tmp_path / "calibration.json").write_text(json.dumps(
         {"per_kind": {"noul": 1.0, "score": 1.0, "choice": 2.0}}))
-    rng = np.random.default_rng(0)
-    save_file({"ids": np.array(ids, dtype=np.int64),
-               "weight": rng.normal(size=(24, HIDDEN)).astype(np.float32),
-               "lora_a": rng.normal(size=(2, HIDDEN)).astype(np.float32),
-               "lora_b": rng.normal(size=(24, 2)).astype(np.float32)},
-              str(tmp_path / "readout.safetensors"))
     return tmp_path
 
 
-class FakeSglang:
-    """/v1/models once up; /generate answers each text with a last hidden state taken from
-    `hidden_for(text)`, or with `fail` when set."""
+def logprobs_for(text, ids):
+    """The engine's option-token logprobs: a fixed lean per prompt, so each answer is checkable."""
+    lean = 1.5 if "jump" in text else -0.5
+    return {t: -0.1 * i + (lean if i == 1 else 0.0) for i, t in enumerate(ids)}
 
-    def __init__(self, hidden_for):
+
+class FakeOpenAI:
+    """/v1/models once up; /v1/completions answers one prompt with its option tokens' logprobs,
+    keyed "token_id:<id>" as return_tokens_as_token_ids asks, or with `fail` when set."""
+
+    def __init__(self):
         self.up, self.fail, self.requests = False, None, []
         engine = self
 
@@ -132,7 +128,7 @@ class FakeSglang:
                 self.wfile.write(data)
 
             def do_GET(self):
-                self._send(200, {"data": [{"id": "jev"}]}) if engine.up else self._send(503, {})
+                self._send(200, {"data": [{"id": "jev-decision"}]}) if engine.up else self._send(503, {})
 
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -140,8 +136,10 @@ class FakeSglang:
                 if engine.fail:
                     self._send(*engine.fail)
                     return
-                self._send(200, [{"text": "", "meta_info": {"hidden_states": [hidden_for(t)]}}
-                                 for t in body["text"]])
+                lp = logprobs_for(body["prompt"], body["allowed_token_ids"])
+                top = {f"token_id:{t}": v for t, v in lp.items()}
+                self._send(200, {"choices": [{"index": 0, "text": "",
+                                              "logprobs": {"top_logprobs": [top]}}]})
 
             def log_message(self, *args):
                 pass
@@ -152,32 +150,32 @@ class FakeSglang:
 
 
 @pytest.fixture(params=[LocalDecideServer, RunpodDecideServer], ids=["local", "runpod"])
-def box(request, monkeypatch, jev_dir):
+def box(request, monkeypatch, head_dir):
     monkeypatch.setattr(server, "PROBE_INTERVAL_SECONDS", 0.01)
-    engine = FakeSglang(lambda text: [1.0, -1.0, 0.5, 0.0] if "jump" in text else [0.0, 1.0, 0.0, 2.0])
+    engine = FakeOpenAI()
     engine_proc, entrypoint_proc = sleeper(), sleeper()
     image = request.param.from_argv([
-        "--image-id", "img-1", "--engine-url", engine.url, "--jev-dir", str(jev_dir),
+        "--image-id", "img-1", "--engine-url", engine.url, "--head-dir", str(head_dir),
         "--engine-pid", str(engine_proc.pid), "--entrypoint-pid", str(entrypoint_proc.pid),
         "--port", "0"])
     httpd = image.start()
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    yield {"url": f"http://127.0.0.1:{httpd.server_port}", "engine": engine, "jev_dir": jev_dir}
+    yield {"url": f"http://127.0.0.1:{httpd.server_port}", "engine": engine}
     engine_proc.kill()
     entrypoint_proc.kill()
     httpd.shutdown()
     engine.httpd.shutdown()
 
 
-def expected(jev_dir, hidden, lo, n, temp):
-    r = load_file(str(jev_dir / "readout.safetensors"))
-    h = np.array(hidden, dtype=np.float32)
-    z = (r["weight"][lo:lo + n] @ h + r["lora_b"][lo:lo + n] @ (r["lora_a"] @ h)) / temp
-    e = np.exp(z - z.max())
-    return e / e.sum()
+def expected(text, lo, n, temp):
+    ids = list(range(100 + lo, 100 + lo + n))
+    lp = logprobs_for(text, ids)
+    z = [(lp[t] + BIAS[lo + i]) / temp for i, t in enumerate(ids)]
+    e = [math.exp(x - max(z)) for x in z]
+    return [x / sum(e) for x in e]
 
 
-def test_a_chain_job_reads_the_head_over_one_batched_engine_call_per_step(box):
+def test_a_chain_job_reads_each_decision_from_option_token_logprobs(box):
     assert call(box["url"], "GET", "/metadata")[1]["capabilities"] == ["decide"]
     box["engine"].up = True
     health_becomes(box["url"], 200)
@@ -189,22 +187,23 @@ def test_a_chain_job_reads_the_head_over_one_batched_engine_call_per_step(box):
                                                      "payload": payload})
     assert status == 200 and body["status"] == "succeeded"
 
-    choice = expected(box["jev_dir"], [0.0, 1.0, 0.0, 2.0], 8, 3, 2.0)
-    yes_jump = expected(box["jev_dir"], [1.0, -1.0, 0.5, 0.0], 0, 2, 1.0)[1]
-    yes_swim = expected(box["jev_dir"], [0.0, 1.0, 0.0, 2.0], 0, 2, 1.0)[1]
+    choice = expected("Which?", 8, 3, 2.0)
+    yes_jump = expected("jump", 0, 2, 1.0)[1]
+    yes_swim = expected("swim", 0, 2, 1.0)[1]
     steps = {s["key"]: s["probabilities"] for s in body["result"]["steps"]}
-    assert list(steps["dimension"].values()) == pytest.approx(choice.tolist(), abs=1e-6)
+    assert list(steps["dimension"].values()) == pytest.approx(choice, abs=1e-6)
     assert steps["mechanics"] == pytest.approx({"jump": yes_jump, "swim": yes_swim}, abs=1e-6)
-    assert body["result"]["answers"]["dimension"] == ["2d", "3d", "both"][int(choice.argmax())]
+    assert body["result"]["answers"]["dimension"] == ["2d", "3d", "both"][choice.index(max(choice))]
 
-    first, second = box["engine"].requests
-    assert first["return_hidden_states"] == "last" and first["lora_path"] == ["jev-decision"]
-    assert first["text"][0] == ("[kind] choice\n[state] Game prompt: frogs\n[question] Which?\n"
-                                "[options]\nA) 2d\nB) 3d\nC) both\n[decision]:")
-    assert len(second["text"]) == 2 and second["lora_path"] == ["jev-decision"] * 2
-    assert second["text"][0].startswith(
+    first, *mechanics = box["engine"].requests
+    assert first["model"] == "jev-decision" and first["max_tokens"] == 1
+    assert first["allowed_token_ids"] == [108, 109, 110] and first["logprobs"] == 3
+    assert first["prompt"] == ("[kind] choice\n[state] Game prompt: frogs\n[question] Which?\n"
+                               "[options]\nA) 2d\nB) 3d\nC) both\n[decision]:")
+    assert len(mechanics) == 2, "one prompt per request: shared batches move JEV's probabilities"
+    assert mechanics[0]["prompt"].startswith(
         f"[kind] noul\n[state] Game prompt: frogs\ndimension: {body['result']['answers']['dimension']}")
-    assert second["text"][1].endswith("[question] Fits: swim?\n[options]\nfalse\ntrue\n[decision]:")
+    assert mechanics[1]["prompt"].endswith("[question] Fits: swim?\n[options]\nfalse\ntrue\n[decision]:")
 
 
 def test_an_engine_error_or_a_broken_chain_fails_the_whole_job(box):

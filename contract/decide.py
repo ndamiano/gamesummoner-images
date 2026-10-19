@@ -1,8 +1,6 @@
 """The decide queue: a chain of JEV System 1 decisions, each answer appended to the state the next
-step reads. The engine is SGLang serving the base model with the decision LoRA and returning the
-prompt's last hidden state; the decision head (readout rows of lm_head plus its LoRA, the
-per-slot bias and the per-kind temperature) is applied here, because SGLang cannot load the
-adapter's lm_head part over an FP8 lm_head. `engines/jev/prep.py` writes what this reads.
+step reads. Each decision is one OpenAI-shape completion on the decision LoRA: logprobs over the
+option tokens, then JEV's per-slot bias and per-kind temperature (engines/jev/head/).
 """
 
 import argparse
@@ -12,11 +10,9 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-import numpy as np
-from safetensors.numpy import load_file
-
 from contract.server import Server
 
+HEAD_DIR = Path(__file__).resolve().parent.parent / "engines" / "jev" / "head"
 GROUP = 16
 LABELS = "ABCDEFGHIJKLMNOP"
 FIXED = {"noul": ["false", "true"], "score": [str(i) for i in range(6)]}
@@ -28,23 +24,24 @@ class EngineError(Exception):
 
 class Head:
 
-    def __init__(self, jev_dir: Path):
-        head = json.loads((jev_dir / "decision_head.json").read_text())
+    def __init__(self, head_dir: Path):
+        head = json.loads((head_dir / "decision_head.json").read_text())
         self.ranges = head["slots"]["ranges"]
         self.verbalizer = head["verbalizer_ids"]
-        self.bias = np.array(head["bias"], dtype=np.float32)
-        self.temps = json.loads((jev_dir / "calibration.json").read_text())["per_kind"]
-        readout = load_file(jev_dir / "readout.safetensors")
-        self.slot = {int(t): n for n, t in enumerate(readout["ids"])}
-        self.weight, self.lora_a, self.lora_b = readout["weight"], readout["lora_a"], readout["lora_b"]
+        self.bias = head["bias"]
+        self.temps = json.loads((head_dir / "calibration.json").read_text())["per_kind"]
 
-    def probabilities(self, kind: str, hidden: np.ndarray, n: int) -> list[float]:
+    def ids(self, kind: str, n: int) -> list[int]:
         lo = self.ranges[kind][0]
-        rows = [self.slot[t] for t in self.verbalizer[lo: lo + n]]
-        logits = self.weight[rows] @ hidden + self.lora_b[rows] @ (self.lora_a @ hidden)
-        z = (logits + self.bias[lo: lo + n]) / self.temps[kind]
-        e = np.exp(z - z.max())
-        return (e / e.sum()).tolist()
+        return self.verbalizer[lo: lo + n]
+
+    def probabilities(self, kind: str, logprobs: dict[int, float], n: int) -> list[float]:
+        lo = self.ranges[kind][0]
+        z = [(logprobs.get(t, -1e9) + self.bias[lo + i]) / self.temps[kind]
+             for i, t in enumerate(self.ids(kind, n))]
+        top = max(z)
+        e = [math.exp(x - top) for x in z]
+        return [x / sum(e) for x in e]
 
 
 def prompt(kind: str, state: str, question: str, options: list[str]) -> str:
@@ -131,17 +128,18 @@ class DecideServer(Server):
     @classmethod
     def add_arguments(cls, parser: argparse.ArgumentParser) -> None:
         super().add_arguments(parser)
-        parser.add_argument("--engine-url", required=True, help="base url of the SGLang engine")
-        parser.add_argument("--jev-dir", required=True, type=Path,
-                            help="the decision head as engines/jev/prep.py writes it")
-        parser.add_argument("--lora", default="jev-decision",
-                            help="the decision LoRA's name in the engine")
+        parser.add_argument("--engine-url", required=True,
+                            help="base url of the OpenAI-compatible engine serving the decision LoRA")
+        parser.add_argument("--model", default="jev-decision",
+                            help="the decision LoRA's model name in the engine")
+        parser.add_argument("--head-dir", type=Path, default=HEAD_DIR,
+                            help="decision_head.json and calibration.json")
 
     def __init__(self, args: argparse.Namespace):
         super().__init__(args)
         self.engine_url = args.engine_url.rstrip("/")
-        self.head = Head(args.jev_dir)
-        self.lora = args.lora
+        self.model = args.model
+        self.head = Head(args.head_dir)
 
     def ready(self) -> tuple[int, str]:
         try:
@@ -152,27 +150,25 @@ class DecideServer(Server):
         return (200, f"serving {models}") if models else (503, "engine lists no models")
 
     def read(self, kind: str, state: str, questions: list[tuple[str, list[str]]]) -> list[list[float]]:
-        """One batched engine pass: the probabilities over each question's options."""
-        texts = [prompt(kind, state, q, opts) for q, opts in questions]
-        body = {"text": texts, "lora_path": [self.lora] * len(texts),
-                "return_hidden_states": "last",
-                "sampling_params": {"max_new_tokens": 1, "temperature": 0}}
+        """The probabilities over each question's options, one prompt per request: JEV's LoRA
+        path moves probabilities when sequences share a batch."""
+        return [self._one(kind, prompt(kind, state, q, opts), len(opts)) for q, opts in questions]
+
+    def _one(self, kind: str, text: str, n: int) -> list[float]:
+        body = {"model": self.model, "prompt": text, "max_tokens": 1, "temperature": 1.0,
+                "top_p": 1.0, "top_k": 0, "logprobs": n, "allowed_token_ids": self.head.ids(kind, n),
+                "return_tokens_as_token_ids": True, "add_special_tokens": False}
         request = urllib.request.Request(
-            f"{self.engine_url}/generate", data=json.dumps(body).encode(),
+            f"{self.engine_url}/v1/completions", data=json.dumps(body).encode(),
             headers={"Content-Type": "application/json"}, method="POST")
         try:
             with urllib.request.urlopen(request) as r:
-                outs = json.load(r)
+                top = json.load(r)["choices"][0]["logprobs"]["top_logprobs"][0]
         except urllib.error.HTTPError as e:
             raise EngineError(f"Status {e.code}: {e.read().decode(errors='replace')[:2000]}") from e
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, KeyError, IndexError) as e:
             raise EngineError(f"engine unreachable: {e}") from e
-        probs = []
-        for out, (_, opts) in zip(outs, questions):
-            hs = out["meta_info"]["hidden_states"]
-            hidden = np.asarray(hs[-1] if isinstance(hs[0], list) else hs, dtype=np.float32)
-            probs.append(self.head.probabilities(kind, hidden.reshape(-1), len(opts)))
-        return probs
+        return self.head.probabilities(kind, {int(k.split(":")[1]): v for k, v in top.items()}, n)
 
     def run(self, job_type: str, payload: dict) -> tuple[int, dict]:
         try:

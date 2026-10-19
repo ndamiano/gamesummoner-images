@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local decide box: pull JEV and its NVFP4 base, prep the decision head, then run SGLang, the
+# Local decide box: pull JEV and its NVFP4 base, then run vLLM with JEV's decision LoRA, the
 # contract server and the baked worker side by side. Decommissioning the box is ending this
 # script: the contract server's /shutdown signals it, and so does `docker stop`.
 set -euo pipefail
@@ -9,7 +9,6 @@ JEV_REPO=autotrust/JEV-27B-VL
 JEV_REVISION=9e53b8a809d2ab98e3e6a55b2b2dbf94b4c1e84a
 BASE_REPO=unsloth/Qwen3.8-27B-NVFP4
 BASE_REVISION=7d6f8d4d72f56b92b3cdbf22f156b90e1bab0108
-PREP_DIR=/tmp/jev
 ENGINE_PORT=30000
 IMAGE_PORT=8700
 WORKER_DIR=/opt/gamesummoner/worker
@@ -23,7 +22,7 @@ env_get() {
     python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get(sys.argv[2], sys.argv[3]))' \
         "$ENV_FILE" "$1" "${2:-}"
 }
-SGLANG_ARGS_EXTRA=$(env_get SGLANG_ARGS_EXTRA)
+VLLM_ARGS_EXTRA=$(env_get VLLM_ARGS_EXTRA)
 
 pull() {
     python3 -c '
@@ -37,28 +36,22 @@ jev_dir=$(pull "$JEV_REPO" "$JEV_REVISION" "adapter_vllm/*" "*.json" "*.jinja" "
 base_dir=$(pull "$BASE_REPO" "$BASE_REVISION")
 mark "weights at $jev_dir, $base_dir"
 
-PYTHONPATH=/opt/gamesummoner python3 -m engines.jev.prep \
-    --jev "$jev_dir" --base "$base_dir" --out "$PREP_DIR"
-mark "decision head prepped in $PREP_DIR"
-
 engine_args=(
-    --model-path "$PREP_DIR/model" --served-model-name jev-27b-vl
-    --enable-lora --max-lora-rank 32 --lora-paths "jev-decision=$PREP_DIR/adapter_sglang"
-    --lora-strict-loading --max-loras-per-batch 2
-    --enable-return-hidden-states
-    --context-length 131072 --mem-fraction-static 0.91 --chunked-prefill-size 2048
-    --cuda-graph-max-bs-prefill 512 --max-running-requests 1
-    --host 127.0.0.1 --port "$ENGINE_PORT"
+    serve "$base_dir" --tokenizer "$jev_dir" --served-model-name jev-base
+    --enable-lora --max-lora-rank 32 --lora-modules "jev-decision=$jev_dir/adapter_vllm"
+    --logprobs-mode processed_logprobs --max-logprobs 32 --max-model-len 32768 --max-num-seqs 8
+    --gpu-memory-utilization 0.90 --enforce-eager --limit-mm-per-prompt '{"image":0,"video":0}'
+    --load-format runai_streamer --host 127.0.0.1 --port "$ENGINE_PORT"
 )
-read -r -a extra_args <<< "$SGLANG_ARGS_EXTRA"
+read -r -a extra_args <<< "$VLLM_ARGS_EXTRA"
 engine_args+=("${extra_args[@]}")
 
 mark "starting engine: ${engine_args[*]}"
-python3 -m sglang.launch_server "${engine_args[@]}" &
+vllm "${engine_args[@]}" &
 engine_pid=$!
 
 PYTHONPATH=/opt/gamesummoner python3 -m local.decide.server \
-    --engine-url "http://127.0.0.1:$ENGINE_PORT" --jev-dir "$PREP_DIR" --engine-pid "$engine_pid" \
+    --engine-url "http://127.0.0.1:$ENGINE_PORT" --engine-pid "$engine_pid" \
     --image-id "$(cat /opt/gamesummoner/image-id)" --cli-params="${engine_args[*]}" \
     --entrypoint-pid $$ --port "$IMAGE_PORT" &
 contract_pid=$!
